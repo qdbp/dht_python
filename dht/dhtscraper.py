@@ -63,7 +63,8 @@ CONTROL_SLEEP = 1.0
 INFO_SLEEP = 5.0
 SAVE_SLEEP = 60.0
 
-MAX_NODES = 100000
+MAX_NODES = 25000
+MAX_IHASHES = 25000
 GP_TIMEOUT = 1.0
 GP_QS_PER_IH = 3
 FP_THRESH = MAX_NODES // 2
@@ -85,7 +86,7 @@ def in_data(fn):
 SALT = b'\x13\x37' + int.to_bytes(DHT_LPORT, 2, 'big')
 
 
-@lru_cache(maxsize=1 << 20)
+@lru_cache(maxsize=1 << 10)
 def mk_sid(nid: bytes) -> bytes:
     return nid[:2] + sha1(nid + SALT).digest()[2:]  # type: ignore
 
@@ -218,7 +219,7 @@ class DHTScraper:
             for ix in range(0, len(packed_nodes), 26):
                 self.nodes.add(packed_nodes[ix:ix + 26])
 
-    @lru_cache(maxsize=1 << 20)
+    @lru_cache(maxsize=1 << 10)
     def db_have_ihash(self, ih):
         res = self._db.execute('SELECT ih FROM ih_info WHERE ih=?', (ih,))
         return bool(res.fetchone())
@@ -255,37 +256,40 @@ class DHTScraper:
     def handle_query(self, saddr, msg: Dict[bytes, Any]) -> Optional[bytes]:
 
         try:
-            tok = msg[b't']
+            # tok = msg[b't']
             method = msg[b'q']
             args = msg[b'a']
-            nid = args[b'id']
+            # nid = args[b'id']
         except KeyError:
             self.cnt['bm_bad_query'] += 1
             return None
 
-        sid = mk_sid(nid)
+        # sid = mk_sid(nid)
 
         if method == b'find_node':
             self.cnt['rx_find_node'] += 1
             return None
-            self.cnt['tx_find_node_r'] += 1
-            return mk_gp_fp_reply(sid, tok, 0)
+            # self.cnt['tx_find_node_r'] += 1
+            # return mk_gp_fp_reply(sid, tok, 0)
 
         elif method == b'ping':
             self.cnt['rx_ping'] += 1
             return None
-            self.cnt['tx_ping_r'] += 1
-            return mk_ping_ap_reply(sid, tok)
+            # self.cnt['tx_ping_r'] += 1
+            # return mk_ping_ap_reply(sid, tok)
 
         elif method == b'get_peers':
             ih = args[b'info_hash']
-            if not self.db_have_ihash(ih) or random() < IHASH_REFRESH_RATE:
+            if ((len(self.naked_ihashes) < MAX_IHASHES) and
+                    ((not self.db_have_ihash(ih)) or
+                        (random() < IHASH_REFRESH_RATE))):
+
                 self.naked_ihashes.add(args[b'info_hash'])
 
             self.cnt['rx_get_peers'] += 1
             return None
-            self.cnt['tx_get_peers_r'] += 1
-            return mk_gp_fp_reply(sid, tok, 1)
+            # self.cnt['tx_get_peers_r'] += 1
+            # return mk_gp_fp_reply(sid, tok, 1)
 
         elif method == b'announce_peer':
             if args[b'token'] != TOKEN:
@@ -302,8 +306,8 @@ class DHTScraper:
 
             self.cnt['rx_announce_peer'] += 1
             return None
-            self.cnt['tx_announce_peer_r'] += 1
-            return mk_ping_ap_reply(sid, tok)
+            # self.cnt['tx_announce_peer_r'] += 1
+            # return mk_ping_ap_reply(sid, tok)
 
         else:
             try:
