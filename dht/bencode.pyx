@@ -111,7 +111,10 @@ cdef object _bdecode(unsigned char* data, unsigned int *ix):
 cpdef object bdecode(bytes data):
     cdef:
         unsigned int ix = 0
-    return _bdecode(data, &ix)
+    try:
+        return _bdecode(data, &ix)
+    except Exception:
+        raise BdecodeError()
 
 cpdef bytes bencode(object data):
     if isinstance(data, bytes):
