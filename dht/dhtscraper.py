@@ -4,27 +4,28 @@ Stateless DHT scraper.
 from atexit import register as atxreg
 import asyncio as aio
 from asyncio import sleep as asleep
-from collections import Counter, deque, defaultdict
+from collections import Counter
 from functools import lru_cache, wraps
-from hashlib import sha1
 from ipaddress import IPv4Address
-import re
 import signal as sig
-import socket as sck
 import sys
 import sqlite3 as sql
 import traceback as trc
-from time import sleep, time
-from typing import Callable, Dict, Any, Optional, Tuple, Set, Iterable
+from time import time
+from typing import Dict, Any, Optional, Tuple, Set, Iterable
 
-from numpy.random import bytes as rbytes, random
+import numpy as np
+from numpy.random import bytes as rbytes, random, randint
 from uvloop import new_event_loop as new_uv_loop
 
 # internal
 from .bencode import bdecode, BdecodeError
-from .bencode import mk_gp_fp_reply, mk_ping_ap_reply
-from .util import uncompact_nodeinfo, uncompact_addr, uncompact_port
-from .util import format_uptime
+# from .bencode import mk_gp_fp_reply, mk_ping_ap_reply
+from .util import uncompact_nodeinfo, uncompact_port, mk_sid
+from .util import format_uptime, mk_ping_reply, mk_gp_reply
+from .util import new_sid_addr_table, new_rt_qual_table
+from .util import get_neighbor_nid, random_replace_contact, adj_quality
+from .util import get_random_node
 
 from vnv.util import save_pickle, load_pickle
 from vnv.log import get_logger
@@ -35,12 +36,6 @@ Addr = Tuple[str, int]
 # net: sockets
 DHT_LPORT = int(sys.argv[1])
 
-# this is a reference node we given when replying to find_peer requests
-REF_NODE = (
-    b'\xb3\x97\xd6\x06\xa3s{\xa5Q\x03@>\x14P'
-    b'\xd4L\xc8\xd6\x99>P\x1f\xc3\xe6A\x9b'
-)
-
 TOK = b'\x77'
 TOKEN = b'\x88'
 
@@ -50,8 +45,8 @@ BOOTSTRAP = [('67.215.246.10', 6881)]
 # info: control
 CONTROL_SECS = 1
 # get peers reponse rate target
-GPRR_FLOOR = 0.7
-GPRR_CEIL = 0.8
+GPRR_FLOOR = 0.70
+GPRR_CEIL = 0.80
 REPORT_SECS = 5
 
 # loop granularities
@@ -66,15 +61,20 @@ SAVE_SLEEP = 60.0
 MAX_NODES = 25000
 MAX_IHASHES = 25000
 GP_TIMEOUT = 1.0
-GP_QS_PER_IH = 3
+GP_QS_PER_IH = 2
 FP_THRESH = MAX_NODES // 2
 FP_NUMBER = 5
 INFO_HEADER_EVERY = 10
 # if the nodes queue is full, we send this many get_peers requests per
 # find_node
-IHASH_REFRESH_RATE = 0.03
-MIN_IFL_TARGET = 100
-INIT_IFL_TARGET = 1000
+IHASH_REFRESH_RATE = 0.01
+PING_RATE = 0.05
+# drop perfectly good ihashes with this rate to prevent zeroing in on a
+# "difficult" set
+# IHASH_DECAY_RATE = 0.01
+
+MIN_IFL_TARGET = 10
+INIT_IFL_TARGET = 500
 
 DB_FN = './data/dht.db'
 
@@ -83,17 +83,9 @@ def in_data(fn):
     return './data/' + fn
 
 
-SALT = b'\x13\x37' + int.to_bytes(DHT_LPORT, 2, 'big')
-
-
-@lru_cache(maxsize=1 << 10)
-def mk_sid(nid: bytes) -> bytes:
-    return nid[:2] + sha1(nid + SALT).digest()[2:]  # type: ignore
-
-
-def iter_nodes(nodes: bytes):
-    for i in range(0, len(nodes), 26):
-        yield uncompact_nodeinfo(nodes[i:i + 26])
+def iter_nodes(packed_nodes: bytes):
+    for i in range(0, len(packed_nodes), 26):
+        yield uncompact_nodeinfo(packed_nodes[i:i + 26])
 
 
 # FIXME: take out to vnv
@@ -164,7 +156,7 @@ class DHTListener:
 
 class DHTScraper:
 
-    saved_attributes = ['naked_ihashes', 'nodes']
+    saved_attributes = ['naked_ihashes', 'rt', 'rt_qual']
 
     def __init__(self):
         # == DHT ==
@@ -175,9 +167,9 @@ class DHTScraper:
         # indexed by associated nids; this is onto
         self.info_in_flight: Dict[bytes, Optional[Tuple[bytes, float]]] = {}
 
-        # a set of nodes to use as a pool to find more nodes and
-        # send get_peers queries
-        self.nodes: Set[bytes] = set()
+        # a table of compact sid, addrs indexed by the two-byte routing prefix
+        self.rt: np.ndarray = new_sid_addr_table()
+        self.rt_qual: np.ndarray = new_rt_qual_table()
 
         self.load_data()
 
@@ -215,9 +207,15 @@ class DHTScraper:
         Since each find_nodes query returns more than one node back
         on average, we can use the extra calls to send get_peers queries.
         '''
-        if len(self.nodes) < MAX_NODES:
-            for ix in range(0, len(packed_nodes), 26):
-                self.nodes.add(packed_nodes[ix:ix + 26])
+        for ix in range(0, len(packed_nodes), 26):
+            packed_node = packed_nodes[ix: ix + 26]
+            if len(packed_node) == 26:
+                random_replace_contact(
+                    self.rt, self.rt_qual, packed_node,
+                )
+                if random() < PING_RATE:
+                    _, sid, addr = self.get_nid_sid_addr(packed_node)
+                    self.query_ping_node(sid, addr)
 
     @lru_cache(maxsize=1 << 10)
     def db_have_ihash(self, ih):
@@ -256,15 +254,13 @@ class DHTScraper:
     def handle_query(self, saddr, msg: Dict[bytes, Any]) -> Optional[bytes]:
 
         try:
-            # tok = msg[b't']
+            tok = msg[b't']
             method = msg[b'q']
             args = msg[b'a']
-            # nid = args[b'id']
+            nid = args[b'id']
         except KeyError:
             self.cnt['bm_bad_query'] += 1
             return None
-
-        # sid = mk_sid(nid)
 
         if method == b'find_node':
             self.cnt['rx_find_node'] += 1
@@ -274,9 +270,8 @@ class DHTScraper:
 
         elif method == b'ping':
             self.cnt['rx_ping'] += 1
-            return None
-            # self.cnt['tx_ping_r'] += 1
-            # return mk_ping_ap_reply(sid, tok)
+            self.cnt['tx_ping_r'] += 1
+            return mk_ping_reply(mk_sid(nid), tok)  # type: ignore
 
         elif method == b'get_peers':
             ih = args[b'info_hash']
@@ -287,9 +282,8 @@ class DHTScraper:
                 self.naked_ihashes.add(args[b'info_hash'])
 
             self.cnt['rx_get_peers'] += 1
-            return None
-            # self.cnt['tx_get_peers_r'] += 1
-            # return mk_gp_fp_reply(sid, tok, 1)
+            self.cnt['tx_get_peers_r'] += 1
+            return mk_gp_reply(mk_sid(nid), tok)
 
         elif method == b'announce_peer':
             if args[b'token'] != TOKEN:
@@ -324,6 +318,9 @@ class DHTScraper:
         Slower than the heuristic method, but exact.
         '''
 
+        # preemptively encode as ascii to avoid idna encoding in uvloop
+        saddr = (saddr[0].encode('ascii'), saddr[1])
+
         try:
             resp = msg[b'r']
             nid = resp[b'id']
@@ -345,6 +342,9 @@ class DHTScraper:
                 ih_or_none = self.info_in_flight.get(nid)
                 if ih_or_none is not None:
 
+                    # ... nids that get useful reponses get a bump in quality
+                    adj_quality(self.rt, self.rt_qual, nid, 5)
+
                     del self.info_in_flight[nid]
                     ih = ih_or_none[0]
 
@@ -360,6 +360,8 @@ class DHTScraper:
                 else:
                     self.cnt['bm_gp_reply_not_in_ifl']
             else:
+                # nids that give garbage are downvoted
+                adj_quality(self.rt, self.rt_qual, nid, -1)
                 self.cnt['bm_token_no_peers_or_nodes'] += 1
 
         elif b'nodes' in resp:
@@ -390,7 +392,7 @@ class DHTScraper:
         if msg_type == b'q':
             reply_msg = self.handle_query(addr, msg)
             if reply_msg is not None:
-                self.send_msg_prio(reply_msg, addr)
+                self.send_msg(reply_msg, addr)
 
         elif msg_type == b'r':
             self.handle_response(addr, msg)
@@ -400,7 +402,10 @@ class DHTScraper:
         else:
             self.cnt['bm_unknown_type']
 
-    def query_find_random_node(self, sid, addr):
+    def query_find_random_node(self, sid: bytes, addr) -> None:
+        return self.query_find_node(rbytes(20), sid, addr)
+
+    def query_find_node(self, target: bytes, sid: bytes, addr) -> None:
         '''
         Solicit a new random node based on our current self id and the current
         state
@@ -408,7 +413,7 @@ class DHTScraper:
         self.cnt['tx_find_node'] += 1
         msg = (
             b'd1:ad2:id20:' + sid +
-            b'6:target20:' + rbytes(20) +
+            b'6:target20:' + target +
             b'e1:q9:find_node1:t1:\x771:y1:qe'
         )
         self.send_msg(msg, addr)
@@ -429,8 +434,8 @@ class DHTScraper:
         else:
             self.send_msg(msg, addr)
 
-    def get_next_nid_sid_addr(self):
-        nid, addr = uncompact_nodeinfo(self.nodes.pop())
+    def get_nid_sid_addr(self, packed_node: bytes):
+        nid, addr = uncompact_nodeinfo(packed_node)
         sid = mk_sid(nid)
         return nid, sid, addr
 
@@ -441,36 +446,51 @@ class DHTScraper:
                 ih = self.naked_ihashes.pop()
             except KeyError:
                 self.cnt['info_naked_hashes_exhausted'] += 1
-                return
+                rnode = get_random_node(self.rt)
+                if rnode:
+                    _, sid, addr = self.get_nid_sid_addr(rnode)
+                    self.query_find_random_node(sid, addr)
+                break
 
-            for i in range(GP_QS_PER_IH):
-                try:
-                    nid, sid, addr = self.get_next_nid_sid_addr()
-                except KeyError:
-                    self.cnt['info_nodes_exhausted']
-                    return
+            # try to get a node close to the infohash
+            packed_node = get_neighbor_nid(self.rt, ih)
 
-                if nid in self.info_in_flight:
-                    self.cnt['info_node_already_in_ifl']
-                    continue
+            # if we have no node for this section, ask the router
+            # XXX this is bad form, we should ask a random other
+            # node instead
+            if packed_node is None:
+                rnode = get_random_node(self.rt)
+                if rnode:
+                    _, sid, addr = self.get_nid_sid_addr(rnode)
+                    self.query_find_node(ih, sid, addr)
+                continue
+            
+            nid, daddr = uncompact_nodeinfo(packed_node)
 
-                self.query_get_peers(sid, ih, addr, prio=False)
-                self.info_in_flight[nid] = (ih, time() + GP_TIMEOUT)
-                self.cnt['info_naked_ih_put_in_ifl'] += 1
+            if nid in self.info_in_flight:
+                self.cnt['info_node_already_in_ifl']
+                continue
+
+            sid = mk_sid(nid)
+            self.query_get_peers(sid, ih, daddr, prio=False)
+            self.info_in_flight[nid] = (ih, time() + GP_TIMEOUT)
+            self.cnt['info_naked_ih_put_in_ifl'] += 1
 
     @aio_loop_method(FP_SLEEP)
     def loop_find_nodes(self):
         '''
-        Send out find_node.
+        Send out find_node randomly.
 
-        The goal is to inject ourselves into as many node's routing tables
-        as possible.
+        The goal is to inject ourselves into as many nodes' routing tables
+        as possible, and to refresh the routing table.
         '''
         try:
-            if len(self.nodes) < FP_THRESH:
-                for i in range(FP_NUMBER):
-                    _, sid, addr = self.get_next_nid_sid_addr()
-                    self.query_find_random_node(sid, addr)
+            ax, bx, cx = randint(0, 256), randint(0, 256), randint(0, 5)
+            _, sid, addr = self.get_nid_sid_addr(bytes(self.rt[ax, bx, cx]))
+            # zero port means zero entry
+            if addr[1] > 0:
+                self.query_find_random_node(sid, addr)
+
         except KeyError:
             self.cnt['loop_fn_nodes_exchausted']
 
@@ -483,20 +503,27 @@ class DHTScraper:
 
         cur_time = time()
 
-        to_pop = {
+        bad_nids = {
             k for k, v in self.info_in_flight.items()
             if v is None or v[1] < cur_time
         }
 
-        for timed_out in to_pop:
+        recycle_ihashes = len(self.naked_ihashes) < MAX_IHASHES // 2
+
+        for bad_nid in bad_nids:
             try:
-                maybe_ih = self.info_in_flight[timed_out]
+                maybe_ih = self.info_in_flight[bad_nid]
                 if maybe_ih is not None:
                     ih = maybe_ih[0]
-                    if not self.db_have_ihash(ih) or\
-                            random() < IHASH_REFRESH_RATE:
+                    if (recycle_ihashes and (
+                            not self.db_have_ihash(ih) or
+                            random() < IHASH_REFRESH_RATE)):
+
                         self.naked_ihashes.add(ih)
-                del self.info_in_flight[timed_out]
+
+                adj_quality(self.rt, self.rt_qual, bad_nid, -1)
+
+                del self.info_in_flight[bad_nid]
                 self.cnt['info_stale_ifl_purged'] += 1
 
             except KeyError:
@@ -504,10 +531,9 @@ class DHTScraper:
 
     @aio_loop_method(BOOTSTRAP_SLEEP)
     def loop_boostrap(self):
-        if len(self.nodes) < 10:
+        if self.apx_filled_rt_ratio < 0.01:
             for addr in BOOTSTRAP:
                 self.query_find_random_node(rbytes(20), addr)
-            LOG.info('Bootstrapped.')
 
     @aio_loop_method(SAVE_SLEEP, init_sleep=SAVE_SLEEP)
     def loop_save_data(self):
@@ -549,9 +575,13 @@ class DHTScraper:
             f'{x["rx_find_node"]:>5d} {x["rx_find_node_r"]:>5d} '  # len 12
             f'{x["rx_get_peers"]:>5d} {x["rx_get_peers_r"]:>5d} '  # len 12
             f'{x["rx_announce_peer"]:>5d}    | '  # len 11
-            f'{x["tx_find_node"]:>5d} {x["tx_get_peers"]:>5d} | '  # len 14
+            f'{x["tx_find_node"]:>5d} {x["tx_get_peers"]:>5d} '  # len 14
+            f'{x["tx_get_peers_r"]:>5d} {x["tx_ping"]:>5d} '  # len 12
+            f'{x["tx_ping_r"]:>5d} | '  # len 6
             f'{x["info_db_ih_updates"]:>4d} '  # len 5
-            f'{min(gprr, 1.0):>4.2f} {self.ifl_target:>4d}'  # len 5
+            f'{min(gprr, 1.0):>4.2f} {self.ifl_target:>4d} '  # len 10
+            f'{len(self.naked_ihashes)/MAX_IHASHES:>4.2f} '  # len 5
+            f'{self.average_quality:>6.4f} '  # len 5
         )
 
         header = (
@@ -560,8 +590,8 @@ class DHTScraper:
             '   fn  fn_r '
             '   gp  gp_r '
             '   ap  |tx>'
-            '   fn    gp | '
-            '  db gprr load'
+            '   fn    gp  gp_r    pg  pg_r | '
+            '  db gprr load nihs   qual'
         )
 
         if not self._info_iter:
@@ -593,6 +623,7 @@ class DHTScraper:
 
     def dump_info(self, signum, frame):
 
+        self._info_iter = 0
         s = '\n'.join(
             [
                 ' ' * 15 + '{:.<30}{:->15}'
@@ -613,3 +644,11 @@ class DHTScraper:
                 setattr(self, fn, load_pickle(in_data(fn)))
             except (FileNotFoundError, OSError):
                 continue
+
+    @property
+    def apx_filled_rt_ratio(self):
+        return np.mean(self.rt[:, :, :, 0]) / 127.5
+
+    @property
+    def average_quality(self):
+        return np.mean(self.rt_qual)
