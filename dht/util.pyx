@@ -37,22 +37,46 @@ cpdef bytes mk_sid(const unsigned char *nid):
 
     return bytes(buf[0:20])
 
-cpdef bytes compact_addr(str exp_addr, unsigned short port):
-    return inet_aton(exp_addr).bytes() + port.to_bytes(2, 'big')
+cpdef bytes compact_ip(bytes ip_addr):
+    '''
+    A reduced for if inet_aton that accepts bytes instead of str.
+    '''
+    cdef:
+        unsigned int ix = 0
+        unsigned int jx = 0
+        unsigned int bx = 0
+        unsigned int tx = 0
+        unsigned int lb = len(ip_addr)
+        unsigned char buf[4]
+
+    for bx in range(lb):
+        if ip_addr[bx] == 0x2e:
+            tx += 1
+            if tx > 3:
+                return None
+        elif 0x30 <= ip_addr[bx] < 0x40:
+            buf[tx] = buf[tx] * 10 + (ip_addr[bx] - 0x30)
+        else:
+            return None
+
+    return bytes(buf[0:4])
+
+cpdef bytes compact_addr(bytes exp_addr, unsigned short port):
+    return compact_ip(exp_addr) + port.to_bytes(2, 'big')
 
 @cython.wraparound(False)
-cpdef object uncompact_port(unsigned char *cp):
+cpdef object uncompact_peer_partial(unsigned char *cp):
     '''
     Unpacks a 6-byte peer info bytes into a 4 byte compact addr and int port.
     '''
     return cp[:4], cp[4] * 256 + cp[5]
 
 @cython.wraparound(False)
-cpdef object uncompact_addr(unsigned char *cp):
+cpdef object uncompact_peer_full(unsigned char *cp):
     '''
     Unpacks a 6-byte peer info bytes into a four-byte address and int port.
     '''
-    return <bytes>inet_ntoa(cp[:4]), cp[4] * 256 + cp[5]
+    return inet_ntoa(cp[:4]).encode('ascii'), cp[4] * 256 + cp[5]
 
 @cython.wraparound(False)
 cpdef object uncompact_nodeinfo(unsigned char *cp):
@@ -60,7 +84,7 @@ cpdef object uncompact_nodeinfo(unsigned char *cp):
     Unpacks a 26-byte note information bytes into a 20-byte node id,
     dot notation ip address and int port.
     '''
-    return cp[:IH_LEN], uncompact_addr(cp[IH_LEN:NODEINFO_LEN])
+    return cp[:IH_LEN], uncompact_peer_full(cp[IH_LEN:NODEINFO_LEN])
 
 cpdef long d_kad(bytes a, bytes b):
     return 256*(a[0] ^ b[0]) + (a[1] ^ b[1])
@@ -208,14 +232,14 @@ cpdef void insert_nid(
 
 cdef unsigned int do_evict(unsigned int qual):
     '''
-    Evicts qual 0 with prob 1/2, qual 1 with 1/4, etc
+    Evicts qual x with prob 1 / (2 ^ x).
     '''
 
-    return (rand() % (1 << qual)) == 0
+    return (rand() & ((1 << qual) - 1)) == 0
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef void random_replace_contact(
+cpdef unsigned int random_replace_contact(
         np.ndarray[uint8_t, ndim=4] t,
         np.ndarray[uint8_t, ndim=3] q, 
         const unsigned char *new_contact):
@@ -230,26 +254,19 @@ cpdef void random_replace_contact(
     '''
 
     cdef:
-        unsigned int ax, bx, cx, ix, jx
+        unsigned int ax, bx, cx, jx
         np.ndarray[uint8_t, ndim=1] row
 
     ax = new_contact[0]
     bx = new_contact[1]
     cx = rand() % CONTACTS_PER_SLOT
 
-    for ix in range(cx, CONTACTS_PER_SLOT):
-        if do_evict(q[ax][bx][ix]):
-            row = t[ax][bx][ix]
-            for jx in range(NODEINFO_LEN):
-                row[jx] = new_contact[jx]
-            return
-
-    for ix in range(cx):
-        if do_evict(q[ax][bx][ix]):
-            row = t[ax][bx][ix]
-            for jx in range(NODEINFO_LEN):
-                row[jx] = new_contact[jx]
-            return
+    if do_evict(q[ax][bx][cx]):
+        row = t[ax][bx][cx]
+        for jx in range(NODEINFO_LEN):
+            row[jx] = new_contact[jx]
+        return 1
+    return 0
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -276,19 +293,66 @@ cpdef unsigned int adj_quality(
     # failed to find a match
     return 0
 
-cpdef bytes mk_ping_reply(bytes sid, bytes tok):
+cpdef bytes bencode_tok(bytes tok):
 
     cdef int lt = len(tok)
-    cdef bytes slt = str(len(tok)).encode('ascii')
+    cdef bytes slt = str(lt).encode('ascii')
 
-    return b'd1:rd2:id20:' + sid + b'e1:t' + slt + b':' + tok + b'1:y1:re'
+    return slt + b':' + tok
 
-cpdef bytes mk_gp_reply(bytes sid, bytes tok):
+cdef unsigned int KAD_TAB[256]
+KAD_TAB[:] = (
+    [8] + [7] + [6] * 2 + [5] * 4 + [4] * 8 + [3] * 16 + [2] * 32 + [1] * 64 +
+    [0] * 128 
+)[:]
 
-     cdef int lt = len(tok)
-     cdef bytes slt = str(len(tok)).encode('ascii')
+cpdef unsigned int lkad(bytes x, bytes y):
+    '''
+    Logaritmic approximation to the kademlia distance: the index of the
+    first differing bit.
+    '''
+    cdef:
+        unsigned int out = 0
+        unsigned int ix = 0
+    
+    for ix in range(IH_LEN):
+        dist = KAD_TAB[x[ix] ^ y[ix]]
+        out += dist
+        if dist:
+            break
 
-     return (
-        b'd1:rd2:id20:' + sid + b'5:token1:\x886:valuesle'
-        b'1:t' + slt + b':' + tok + b'1:y1:re'
-    )
+    return out
+
+@cython.wraparound(False)
+cpdef unsigned int validate_ip(unsigned char *ip):
+
+    cdef:
+        unsigned char a = ip[0]
+        unsigned char b = ip[1]
+        unsigned char c = ip[2]
+        unsigned char d = ip[3]
+
+    # taken from https://www.iana.org/assignments/iana-ipv4-special-registry/
+    if (
+            ((a & 0xf0) == 240) or # 240.0.0.0/4
+            (a == 0) or
+            (a == 10) or
+            (a == 127) or
+            (a == 100 and (b & 0xc0) == 64) or
+            (a == 172 and (b & 0xf0) == 16) or
+            (a == 198 and (b &0xfe == 18)) or
+            (a == 169 and b == 254) or
+            (a == 192 and b == 168) or
+            (a == 192 and b == 0   and c == 0) or
+            (a == 192 and b == 0   and c == 2) or
+            (a == 192 and b == 31  and c == 196) or
+            (a == 192 and b == 51  and c == 100) or
+            (a == 192 and b == 52  and c == 193) or
+            (a == 192 and b == 175 and c == 48) or
+            (a == 198 and b == 51  and c == 100) or
+            (a == 203 and b == 0   and c == 113) or
+            (a == 255 and b == 255 and c == 255 and d == 255)):
+
+        return 0
+
+    return 1
