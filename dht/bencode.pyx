@@ -1,20 +1,31 @@
-# cython: boundscheck=False
+# cython: profile=True
+# cython: wraparound=False
 
 from libc.stdlib cimport atoi
-from libc.string cimport const_char
+from libc.string cimport memcmp, memset
 
 cimport cython
 
-# from libc.stdint cimport uint8_t as u8
+from libc.stdint cimport uint8_t as u8, uint64_t as u64, uint16_t as u16, uint32_t as u32
 # from libc.stdint cimport uint64_t as u64
 
-
 cdef:
-
-    NUMS = [str(x).encode()[0] for x in range(10)]
-    R_NUMS = {ord(str(n).encode()): n for n in range(10)}
     STRLEN = {n : str(n).encode() for n in range(1024)}
     unsigned char COL_ORD = ord(b':')
+
+    struct bdec_res:
+        bint fail
+        unsigned char tok[32]
+        u64 tok_len
+        unsigned char nid[20]
+        unsigned char ih[20]
+        u64 method
+        unsigned char nodes[26 * 8]
+        u64 nodes_len
+        unsigned char peers[6 * 8]
+        u64 peers_len
+        unsigned char token[32]
+        bint implied_port
 
 class BdecodeError(Exception):
     pass
@@ -22,7 +33,7 @@ class BdecodeError(Exception):
 class BencodeError(Exception):
     pass
 
-cdef inline int _bdecode_atoi(unsigned char* buf, unsigned int *ix):
+cdef inline int bdecode_atoi(bytes buf, u64 *ix):
     '''
     Decode strictly nonnegative, colon-terminated decimal integers. Fast.
 
@@ -47,73 +58,78 @@ cdef inline int _bdecode_atoi(unsigned char* buf, unsigned int *ix):
 
     return out * sign
 
-cdef object _bdecode_d(unsigned char* data, unsigned int *ix):
+cdef dict bdecode_d(bytes data, u64 *ix):
+    # print('bdecode_d with data at', ix[0], data[ix[0]:])
     cdef:
         dict out = {}
         object k
 
     ix[0] += 1
-    k = _bdecode(data, ix)
-    while k is not None:
-        out[k] = _bdecode(data, ix)
-        k = _bdecode(data, ix)
+    while True:
+        k = bdecode_dispatch(data, ix)
+        if k is None:
+            break
+        else:
+            out[k] = bdecode_dispatch(data, ix)
     return out
 
-cdef object _bdecode_s(unsigned char* data, unsigned int *ix):
+cdef inline bytes bdecode_s(bytes data, u64 *ix):
+    # print('bdecode_s with data at', ix[0], data[ix[0]:])
     cdef:
-        int c_ix, slen, start
+        int slen, start, out
 
-    slen = _bdecode_atoi(data, ix)
+    # out = bdec_s_heur(data, ix)
+    # if not out:
+    slen = bdecode_atoi(data, ix)
     start = ix[0]
     ix[0] += slen
 
-    return <bytes> data[start:start + slen]
+    return <bytes> data[start:start + slen] 
 
-cdef object _bdecode_e(unsigned char* data, unsigned int *ix):
+cdef inline object bdecode_i(bytes data, u64 *ix):
+    # print('bdecode_i with data at', ix[0], data[ix[0]:])
     ix[0] += 1
-    return None
+    return bdecode_atoi(data, ix)
 
-cdef object _bdecode_i(unsigned char* data, unsigned int *ix):
-    ix[0] += 1
-    return _bdecode_atoi(data, ix)
-
-cdef object _bdecode_l(unsigned char* data, unsigned int *ix):
+cdef object bdecode_l(bytes data, u64 *ix):
+    # print('bdecode_l with data at', ix[0], data[ix[0]:])
     cdef:
         list out = []
         object ret
 
     ix[0] += 1
-    ret = _bdecode(data, ix)
-    while ret is not None:
-        out.append(ret)
-        ret = _bdecode(data, ix)
+    while True:
+        ret = bdecode_dispatch(data, ix)
+        if ret is None:
+            break
+        else:
+            out.append(ret)
     return out
 
-cdef object _bdecode_err(unsigned char* data, unsigned int *ix):
-    raise BdecodeError()
+cdef object bdecode(bytes data):
+    cdef u64 ix = 0
+    return bdecode_dispatch(data, &ix)
 
-cdef object (*BDEC_TAB[256])(unsigned char*, unsigned int*)
-
-for i in range(256):
-    BDEC_TAB[i] = &_bdecode_err
-
-BDEC_TAB[ord(b'd')] = &_bdecode_d
-BDEC_TAB[ord(b'e')] = &_bdecode_e
-BDEC_TAB[ord(b'i')] = &_bdecode_i
-BDEC_TAB[ord(b'l')] = &_bdecode_l
-
-for i in NUMS:
-    BDEC_TAB[i] = &_bdecode_s
-
-cdef object _bdecode(unsigned char* data, unsigned int *ix):
-    return BDEC_TAB[data[ix[0]]](data, ix)
-
-cpdef object bdecode(bytes data):
-    cdef:
-        unsigned int ix = 0
-    try:
-        return _bdecode(data, &ix)
-    except Exception:
+cdef inline object bdecode_dispatch(bytes data, u64 *ix):
+    # print('bdecode_dispatch with data at', ix[0], data[ix[0]:])
+    if 0x30 <= data[ix[0]] < 0x40:
+        # print('s branch')
+        return <object> bdecode_s(data, ix)
+    elif data[ix[0]] == 100:  # b'd'
+        # print('d branch')
+        return <object> bdecode_d(data, ix)
+    elif data[ix[0]] == 108:  # b'l'
+        # print('l branch')
+        return <object> bdecode_l(data, ix)
+    elif data[ix[0]] == 105:  # b'i'
+        # print('i branch')
+        return <object> bdecode_i(data, ix)
+    elif data[ix[0]] == 101:  # b'e'
+        # print('e branch')
+        ix[0] += 1
+        return None
+    else:
+        # print('err branch')
         raise BdecodeError()
 
 cpdef bytes bencode(object data):
@@ -130,30 +146,3 @@ cpdef bytes bencode(object data):
         return b'l' + b''.join([bencode(x) for x in data]) + b'e'
     else:
         raise BencodeError()
-
-cpdef bytes mk_ping_ap_reply(bytes sid, bytes tok):
-
-    cdef bytes out
-
-    return (
-        b'd1:rd2:id20:' + sid + b'e1:t' + str(len(tok)).encode('ascii') + 
-        b':' + tok + b'1:y1:re'
-    )
-
-cpdef bytes mk_gp_fp_reply(bytes sid, bytes tok, int gp):
-    '''
-    Make a reply with an empty list of nodes.
-
-    Can be used to DDoS, I guess, if you put someone's node here.
-    '''
-    cdef bytes out
-
-    return (
-        b'd1:rd2:id20:' + sid +
-        b'5:nodes0:' +
-        # b'\xb3\x97\xd6\x06\xa3s{\xa5Q\x03@>\x14P' + 
-        # b'\xd4L\xc8\xd6\x99>P\x1f\xc3\xe6A\x9b' +
-        (b'5:token1:\x88' if gp else b'') + b'e' +
-        b'1:t' + str(len(tok)).encode('ascii') + b':' +
-        tok + b'1:y1:re'
-    )

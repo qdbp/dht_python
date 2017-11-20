@@ -2,7 +2,7 @@ import sys
 import signal as sig
 import threading as thr
 
-from dht.dhtscraper import LOG, DHTScraper
+from dht.dht import LOG, DHTScraper
 
 
 def main():
