@@ -11,7 +11,7 @@ DEF BD_MAX_PEERS = 32
 DEF BD_MAX_NODES = 8
 
 cdef:
-    enum bdx_error:
+    enum bd_status:
         NO_ERROR = 0
         BD_BUFFER_OVERFLOW = 1
         BD_UNEXPECTED_END = 2
@@ -41,9 +41,19 @@ cdef:
         ERROR_TYPE = 26
         UNKNOWN_Q = 27
 
+    enum krpc_msg_type:
+        Q_AP = 1
+        Q_FN = 1 << 1
+        Q_GP = 1 << 2
+        Q_PG = 1 << 3
+        
+        R_FN = 1 << 5
+        R_GP = 1 << 6
+        R_PG = 1 << 7
+
     struct parsed_msg:
         # self explanatory
-        u64 method
+        krpc_msg_type method
         u8 nid[IH_LEN]
         u8 ih[IH_LEN]
         u8 target[IH_LEN]
@@ -62,8 +72,7 @@ cdef:
         bint ap_implied_port
 
     list g_trace
-    dict bdx_names
+    dict bd_status_names
 
-# cdef dict bdecode_d(unsigned char *, u64 *, u64 maxlen)
-cdef bdx_error krpc_bdecode(bytes, parsed_msg *)
+cdef bd_status krpc_bdecode(bytes, parsed_msg *)
 cdef void print_parsed_msg(parsed_msg *)

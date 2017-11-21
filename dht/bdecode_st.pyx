@@ -6,7 +6,8 @@ from libc.stdlib cimport atoi
 from libc.string cimport memcmp, memset
 
 cimport cython
-from dht.bdecode_st cimport parsed_msg, bdx_error
+from dht.bdecode_st cimport parsed_msg, bd_status
+from dht.bdecode_st cimport krpc_msg_type
 
 from libc.stdint cimport uint8_t as u8, uint64_t as u64, uint16_t as u16, uint32_t as u32
 from libc.stdint cimport int64_t as i64
@@ -40,17 +41,8 @@ DEF OKEY_Y = 1 << 12
 DEF IKEY_ANY_BODY =\
     IKEY_NODES | IKEY_VALUES | IKEY_IH | IKEY_TARGET | IKEY_TOKEN
 
-DEF Q_AP = 1
-DEF Q_FN = 1 << 1
-DEF Q_GP = 1 << 2
-DEF Q_PG = 1 << 3
-
-DEF R_FN = 1 << 5
-DEF R_GP = 1 << 6
-DEF R_PG = 1 << 7
-
-DEF R_ANY =        R_FN | R_GP | R_PG
-DEF Q_ANY = Q_AP | Q_FN | Q_GP | Q_PG
+cdef R_ANY =        R_FN | R_GP | R_PG
+cdef Q_ANY = Q_AP | Q_FN | Q_GP | Q_PG
 
 DEF BD_TRACE = 0
 
@@ -64,7 +56,7 @@ cdef:
         R_GP: 'R_GP',
         R_PG: 'R_PG',
     }
-    dict bdx_names = {
+    dict bd_status_names = {
         0: 'NO_ERROR',
         1: 'BD_BUFFER_OVERFLOW',
         2: 'BD_UNEXPECTED_END',
@@ -97,7 +89,7 @@ cdef:
 
 cdef:
     struct bd_state:
-        bdx_error fail
+        bd_status fail
         u64 dict_depth
         u64 list_depth
         bint at_end
@@ -621,7 +613,7 @@ cdef inline void krpc_bdecode_dispatch(
         IF BD_TRACE: g_trace.append('dispatch: overflow ix, failing')
         state.fail = BD_BUFFER_OVERFLOW
 
-cdef bdx_error krpc_bdecode(bytes data, parsed_msg *out):
+cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
     '''
     Efficiently decodes a KRPC message, looking for pre-existing fields,
     into a fixed parsed_msg structure.
@@ -700,7 +692,7 @@ cdef bdx_error krpc_bdecode(bytes data, parsed_msg *out):
             IF BD_TRACE: g_trace.append('REJECT q_ap && ~(port | ip)')
             return BK_AP_NO_PORT
         else:
-            out.method = state.msg_kind
+            out.method = <krpc_msg_type> state.msg_kind
             return NO_ERROR
 
     # fns need a target

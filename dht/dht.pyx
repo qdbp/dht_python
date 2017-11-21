@@ -8,23 +8,18 @@ from asyncio import sleep as asleep
 from collections import Counter, deque
 from functools import lru_cache, wraps
 from itertools import zip_longest, repeat
-import signal as sig
-import sys
-import sqlite3 as sql
-import traceback as trc
 import pickle
+import os
+import signal as sig
+import sqlite3 as sql
+import sys
+import traceback as trc
 from socket import inet_ntoa
 from time import time, monotonic
 
 import numpy as np
 from numpy.random import bytes as rbytes, random, randint
 from uvloop import new_event_loop as new_uv_loop
-
-# internal
-from dht.bencode import BdecodeError
-from dht.bencode cimport bdecode
-from dht.bdecode_st cimport bdx_error, parsed_msg, krpc_bdecode, print_parsed_msg
-from dht.bdecode_st cimport g_trace, bdx_names
 
 from vnv.util import save_pickle, load_pickle
 from vnv.log import get_logger
@@ -35,7 +30,14 @@ from libc.stdio cimport FILE, fopen, fwrite, fclose, fread, sprintf
 from libc.string cimport memcmp, memset, memcpy
 from libc.math cimport sqrt, fmin, fmax
 
+# internal
 from dht.util cimport LRUCache
+from dht.bencode import BdecodeError
+from dht.bencode cimport bdecode
+from dht.bdecode_st cimport bd_status, parsed_msg, krpc_bdecode, print_parsed_msg
+from dht.bdecode_st cimport g_trace, bd_status_names, krpc_msg_type
+
+
 # from dht.bencode cimport bdecode_d
 
 LOG = get_logger('dht')
@@ -53,7 +55,7 @@ BOOTSTRAP = [('67.215.246.10', 6881)]
 
 # info loop parameters
 DEF INFO_HEADER_EVERY = 10
-DEF TERMINAL_WIDTH = 160
+DEF TERMINAL_WIDTH = 190
 
 # loop granularities
 DEF FP_SLEEP = 0.05
@@ -110,34 +112,6 @@ cdef:
         double std
 
     u8 ZERO_ROW[NODEINFO_LEN]
-
-    struct parsed_msg:
-        # null-terminated token
-        unsigned char tok[32]
-        # token length, for convenience
-        u64 tok_len
-        # self explanatory
-        unsigned char nid[IH_LEN]
-        unsigned char ih[IH_LEN]
-        unsigned char target[IH_LEN]
-        # method used, one of the METHOD_ constants
-        u64 method
-        # nodes, not all will be set
-        unsigned char nodes[NODEINFO_LEN * 8]
-        # number of nodes set
-        u64 num_nodes
-        # gp token
-        unsigned char token[32]
-        # token length
-        u64 token_len
-        # peers, not all will be set
-        unsigned char peers[PEERINFO_LEN * 8]
-        # number of peers set
-        u64 peers_len
-        # if implied port is set
-        bint implied_port
-
-    dict g_bd_dict = {k: set() for k in range(MSG_MIN_LEN, MSG_MAX_LEN + 1)}
 
 memset(ZERO_ROW, 0, NODEINFO_LEN)
 
@@ -459,7 +433,7 @@ cdef class DHTScraper:
             self.cnt['rt_replace_fail'] += (1 - replaced)
             if random() < self.ctl_ping_rate:
                 nid, addr = uncompact_nodeinfo(pnodes[ix: ix + 26])
-                self.send_pg(nid, addr)
+                self.send_q_pg(nid, addr)
 
         return n_nodes
 
@@ -532,11 +506,11 @@ cdef class DHTScraper:
             # XXX
             pnode = self.rt_get_neighbor_nid(target)
             if pnode is not None:
-                self.send_fn_r(pnode, nid, tok, saddr)
+                self.send_q_fn(pnode, nid, tok, saddr)
 
         elif method == b'ping':
             self.cnt['rx_pg'] += 1
-            self.send_pg_r(nid, tok, saddr)
+            self.send_r_pg(nid, tok, saddr)
 
         elif method == b'get_peers':
             self.cnt['rx_gp'] += 1
@@ -560,7 +534,7 @@ cdef class DHTScraper:
             # this is close to compliant behaviour
             pnode = self.rt_get_neighbor_nid(ih)
             if pnode is not None:
-                self.send_gp_r(pnode, nid, tok, saddr)
+                self.send_r_gp(pnode, nid, tok, saddr)
 
         elif method == b'announce_peer':
             self.cnt['rx_ap'] += 1
@@ -591,7 +565,7 @@ cdef class DHTScraper:
 
             self.db_update_peers(ih, [(compact_ip(saddr[0]), p_port)])
             # ap reply is the same as ping
-            self.send_pg_r(nid, tok, saddr)
+            self.send_r_pg(nid, tok, saddr)
 
         else:
             try:
@@ -649,7 +623,7 @@ cdef class DHTScraper:
                     if num_good_nodes > 0:
                         # peel off the first node, which we check we have
                         new_nid, daddr = uncompact_nodeinfo(resp[b'nodes'])
-                        self.send_gp(ih, new_nid, daddr)
+                        self.send_q_gp(ih, new_nid, daddr)
                         self.info_in_flight[new_nid] = (ih, monotonic())
                         self.cnt['info_got_next_hop'] += 1
                         self.rt_adj_quality(nid, 1)
@@ -685,42 +659,36 @@ cdef class DHTScraper:
             return
 
         cdef parsed_msg out
+        cdef bd_status status
 
-        err = krpc_bdecode(d, &out)
-        self.cnt[f'st_code_{bdx_names[err]}'] += 1
+        status = krpc_bdecode(d, &out)
+        self.cnt[f'st_{bd_status_names[status]}'] += 1
 
-        # if err == bdx_error.NO_ERROR or err == bdx_error.UNKNOWN_Q:
-        #     pass
-        #     # print(f'>>> BDECODE_ST SUCCESS:')
-        #     # print_parsed_msg(&out)
-        #     # print('')
+        if status != bd_status.NO_ERROR:
+            return
+
+        if parsed_msg.method
+        # try:
+        #     msg_type = msg[b'y']
+        # except TypeError:
+        #     self.cnt['bm_msg_not_a_dict'] += 1
+        #     return
+        # except KeyError:
+        #     self.cnt['bm_no_type'] += 1
+        #     return
+
+        # # handle a query
+        # if msg_type == b'q':
+        #     self.handle_query(saddr, msg)
+
+        # elif msg_type == b'r':
+        #     self.handle_response(saddr, msg)
+
+        # elif msg_type == b'e':
+        #     self.cnt['rx_e_type'] += 1
+
         # else:
-        #     print(f'!!! BDECODE_ST FAILED WITH {err}\n')
-        #     print(f'ON MESSAGE {d}')
-        #     print('TRACE\n' + '\n\t'.join(g_trace))
-        # # st trial run
-
-        try:
-            msg_type = msg[b'y']
-        except TypeError:
-            self.cnt['bm_msg_not_a_dict'] += 1
-            return
-        except KeyError:
-            self.cnt['bm_no_type'] += 1
-            return
-
-        # handle a query
-        if msg_type == b'q':
-            self.handle_query(saddr, msg)
-
-        elif msg_type == b'r':
-            self.handle_response(saddr, msg)
-
-        elif msg_type == b'e':
-            self.cnt['rx_e_type'] += 1
-
-        else:
-            self.cnt['bm_unknown_type']
+        #     self.cnt['bm_unknown_type']
 
     # FIXME implement
     cdef void send_sample_infohashes(self, bytes nid, tuple addr):
@@ -744,7 +712,7 @@ cdef class DHTScraper:
             addr, 0,
         )
 
-    cdef void send_fn_r(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
+    cdef void send_q_fn(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
         self.cnt['tx_fn_r'] += 1
         self.listener.send_msg(
             (
@@ -757,7 +725,7 @@ cdef class DHTScraper:
         )
         pass
 
-    cdef send_pg(self, u8 *nid, tuple addr):
+    cdef void send_q_pg(self, u8 *nid, tuple addr):
         self.cnt['tx_pg'] += 1
         self.listener.send_msg(
             b'd1:ad2:id20:' + mk_sid(nid) + b'e1:q4:ping1:t1:\x771:y1:qe',
@@ -765,7 +733,7 @@ cdef class DHTScraper:
             0,
         )
 
-    cdef void send_pg_r(self, u8 *nid, bytes tok, tuple daddr):
+    cdef void send_r_pg(self, u8 *nid, bytes tok, tuple daddr):
         '''
         Send a ping reply.
         '''
@@ -779,7 +747,7 @@ cdef class DHTScraper:
             1,
         )
 
-    cdef void send_gp(self, u8 *ih, u8 *nid, tuple addr, u64 prio=0):
+    cdef void send_q_gp(self, u8 *ih, u8 *nid, tuple addr, u64 prio=0):
         '''
         Send get_peers query.
         '''
@@ -791,7 +759,7 @@ cdef class DHTScraper:
         )
         self.listener.send_msg(msg, addr, prio)
 
-    cdef void send_gp_r(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
+    cdef void send_r_gp(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
         '''
         Send get_peers response.
 
@@ -841,7 +809,7 @@ cdef class DHTScraper:
                 self.cnt['info_node_already_in_ifl']
                 continue
 
-            self.send_gp(ih, nid, daddr, prio=False)
+            self.send_q_gp(ih, nid, daddr, prio=False)
             self.info_in_flight[nid] = (ih, monotonic())
             self.cnt['info_naked_ih_put_in_ifl'] += 1
 
@@ -1032,19 +1000,19 @@ cdef class DHTScraper:
             self.loop.stop()
             self.loop.close()
 
-        sig.signal(sig.SIGTSTP, self.dump_info)
+        sig.signal(sig.SIGTSTP, self.print_detailed_info)
         # self.loop.add_signal_handler(sig.SIGINT, stop_all)
 
         self.loop.run_forever()
 
-    def dump_info(self, signal, frame):
+    def print_detailed_info(self, signal, frame):
         '''
         Prints tables of detailed information on request.
         '''
 
         self._info_iter = 0
 
-        cdef int table_width = 25 + 12 + 3
+        cdef int table_width = 35 + 12 + 3
 
         unique_prefixes = {s.split('_')[0] for s in self.cnt if '_' in s}
         tables = {prefix: [] for prefix in unique_prefixes}
@@ -1053,7 +1021,7 @@ cdef class DHTScraper:
             if not '_' in k:
                 continue
             prefix = k.split('_')[0]
-            tables[prefix].append(f' {k:.<25s}{v:.>12d} ')
+            tables[prefix].append(f' {k:.<35s}{v:.>12d} ')
 
         for t in tables.values():
             t.sort()
@@ -1090,6 +1058,9 @@ cdef class DHTScraper:
         ])
 
         LOG.info(output_string)
+
+        # XXX hopefully this fixes the stupidity
+        os.kill(os.getpid(), sig.SIGCONT)
 
     cdef void dump_data(self):
         cdef:
