@@ -37,6 +37,9 @@ from dht.bencode cimport bdecode
 from dht.bdecode_st cimport bd_status, parsed_msg, krpc_bdecode, print_parsed_msg
 from dht.bdecode_st cimport g_trace, bd_status_names, krpc_msg_type
 
+include "dht.pxi"
+
+class BadState(Exception): pass
 
 # from dht.bencode cimport bdecode_d
 
@@ -47,60 +50,11 @@ DHT_LPORT = int(sys.argv[1])
 if len(sys.argv) > 2:
     LOG.setLevel(int(sys.argv[2]))
 
-DEF FULL_TOK = b'1:t1:\x77'
-DEF TOKEN = b'\x88'
+cdef BOOTSTRAP = [('67.215.246.10', 6881)]
 
 # dht: bootstrap, router.bittorrent.com
-BOOTSTRAP = [('67.215.246.10', 6881)]
 
 # info loop parameters
-DEF INFO_HEADER_EVERY = 10
-DEF TERMINAL_WIDTH = 190
-
-# loop granularities
-DEF FP_SLEEP = 0.05
-DEF GP_SLEEP = 0.01
-DEF PURGE_SLEEP = 0.05
-DEF BOOTSTRAP_SLEEP = 1.0
-DEF CONTROL_SLEEP = 1.0
-DEF INFO_SLEEP = 5.0
-DEF SAVE_SLEEP = 60.0
-
-# cache sizes and flush intervals
-DEF MAX_NODES = 25000
-DEF MAX_IHASHES = 25000
-DEF RTT_BUF_LEN = 1000
-DEF ROW_POOL_MAXLEN = 1000
-DEF DB_LRU_MAXSIZE = 25000000
-
-DEF GP_QS_PER_IH = 2
-DEF FP_THRESH = MAX_NODES // 2
-DEF FP_NUMBER = 5
-
-DEF GPRR_FLOOR = 0.30
-DEF GPRR_CEIL = 0.40
-DEF MIN_IFL_TARGET = 10
-DEF BASE_IFL_TARGET = 500
-DEF BASE_IHASH_DISCARD = 0.25
-DEF BASE_IHASH_REFRESH = 0.03
-DEF BASE_PING_RATE = 0.05
-DEF BASE_IHASH_REFRESH_AGE = 3600 * 24
-DEF BASE_GP_TIMEOUT = 1.0
-
-DEF DB_FN = b'./data/dht.db'
-DEF RT_FN = b'./data/rt.dat'
-DEF RT_QUAL_FN = b'./data/rt_qual.dat'
-
-# rt constants
-DEF RT_CONTACTS_PER_BIN = 8
-DEF IH_LEN = 20
-DEF PEERINFO_LEN = 6
-DEF NODEINFO_LEN = IH_LEN + PEERINFO_LEN
-DEF MIN_QUAL = 0
-DEF MAX_QUAL = 7
-
-DEF MSG_MAX_LEN = 600  # arbitrary, but gives generous leeway
-DEF MSG_MIN_LEN = 45  # minimum valid message length with 0-length token
 
 def in_data(fn):
     return './data/' + fn
@@ -311,7 +265,7 @@ cdef class DHTScraper:
         # failed to find a match
         return 0
 
-    cdef bytes rt_get_neighbor_nid(self, bytes target):
+    cdef bytes rt_get_neighbor_nid(self, u8 *target):
         '''
         Returns a nid from the array of nids `narr` whose first two bytes
         match the target.
@@ -408,266 +362,437 @@ cdef class DHTScraper:
             )
             self._db_row_pool.clear()
 
-    cdef u64 handle_new_nodes(self, object pnodes):
-        '''
-        Processes a potential array of packed nodes.
+    # cdef u64 handle_new_nodes(self, object pnodes):
+    #     '''
+    #     Processes a potential array of packed nodes.
 
-        Validates it, and includes all valid-seeming nodes in the routing
-        table according to the eviction rules.
+    #     Validates it, and includes all valid-seeming nodes in the routing
+    #     table according to the eviction rules.
 
-        Returns the number of valid nodes processed.
-        '''
+    #     Returns the number of valid nodes processed.
+    #     '''
 
-        if not isinstance(pnodes, bytes):
-            self.cnt['bm_bad_nodes'] += 1
-            return 0
+    #     if not isinstance(pnodes, bytes):
+    #         self.cnt['bm_bad_nodes'] += 1
+    #         return 0
 
-        n_nodes = len(pnodes) // 26
+    #     n_nodes = len(pnodes) // 26
 
-        cdef int offset
+    #     cdef int offset
 
-        for ix in range(0, 26 * n_nodes, 26):
-            # packed_node = packed_nodes[ix: ix + 26]
-            replaced = self.rt_random_replace_contact(pnodes[ix: ix + 26])
-            self.cnt['rt_replace_success'] += replaced
-            self.cnt['rt_replace_fail'] += (1 - replaced)
+    #     for ix in range(0, 26 * n_nodes, 26):
+    #         # packed_node = packed_nodes[ix: ix + 26]
+    #         replaced = self.rt_random_replace_contact(pnodes[ix: ix + 26])
+    #         self.cnt['rt_replace_success'] += replaced
+    #         self.cnt['rt_replace_fail'] += (1 - replaced)
+    #         if random() < self.ctl_ping_rate:
+    #             nid, addr = uncompact_nodeinfo(pnodes[ix: ix + 26])
+    #             self.send_q_pg(nid, addr)
+
+    #     return n_nodes
+
+    cdef void handle_new_nodes(self, u8 *pnodes, u64 n_nodes):
+        cdef u64 offset
+        cdef bint did_replace
+
+        for offset in range(0, NODEINFO_LEN * n_nodes, NODEINFO_LEN):
+
+            did_replace = self.rt_random_replace_contact(pnodes + offset)
+            self.cnt['rt_replace_success'] += did_replace
+            self.cnt['rt_replace_fail'] += (1 - did_replace)
+
             if random() < self.ctl_ping_rate:
-                nid, addr = uncompact_nodeinfo(pnodes[ix: ix + 26])
+                nid, addr = uncompact_nodeinfo(
+                    pnodes[offset:offset + NODEINFO_LEN],
+                )
                 self.send_q_pg(nid, addr)
 
-        return n_nodes
+    cdef void handle_new_peers(self, u8 *nid, u8* peers, u64 n_peers):
 
-    cdef void handle_new_peers(self, bytes nid, object vals):
+        cdef list good_peers = []
+        cdef u64 offset
+        cdef u16 port
+        cdef object ih_or_none
+        cdef bint got_bad_peer = 0
 
-        cdef:
-            bytes ih
-            list clean_peers = []
+        # FIXME
+        ih_or_none = self.info_in_flight.get(nid[0:IH_LEN])
 
-        try:
-            ih_or_none = self.info_in_flight[nid]
-            if ih_or_none is not None:
-                ih = ih_or_none[0]
-            else:
-                self.cnt['err_peers_nid_invalidated'] += 1
-                return
-        except KeyError:
-            self.cnt['bm_nid_not_in_ifl'] += 1
-            return
+        if ih_or_none is not None:
 
-        if not isinstance(vals, list):
-            self.cnt['bm_gp_r_bad_values'] += 1
+            self.cnt['info_matched_peers'] += 1
+            del self.info_in_flight[nid[0:IH_LEN]]
 
-        elif len(vals) == 0:
-            self.cnt['bm_gp_r_empty_vals'] += 1
+            for offset in range(0, n_peers * PEERINFO_LEN, PEERINFO_LEN):
+
+                if not validate_ip(peers + offset):
+                    got_bad_peer = 1
+                    continue
+
+                port = peers[offset + 4] * 256 + peers[offset + 5]
+                if port == 0:
+                    got_bad_peer = 1
+                    continue
+
+                good_peers.append((peers[offset:offset + 4], port))
 
         else:
-            for raw_peer in vals:
-                # IMPORTANT
-                if len(raw_peer) != PEERINFO_LEN:
-                    self.cnt['bm_gp_r_bad_peer'] += 1
-                    continue
-                ip, port = uncompact_peer_partial(raw_peer)
-                if not validate_ip(ip) or port == 0:
-                    self.cnt['bm_gp_r_bad_peer'] += 1
-                    continue
-                clean_peers.append((ip, port))
+            self.cnt['bm_unmatched_peers'] += 1
+            return
 
-        if len(clean_peers) == 0:
-            self.cnt['bm_gp_r_peers_dirty'] += 1
-            # if any of the bad cases above happen, we want this node gone!
+        ih = ih_or_none[0]
+
+        if len(good_peers) == 0:
+            self.cnt['bm_no_good_peers'] += 1
             self.rt_adj_quality(nid, -3)
             return
 
-        self.db_update_peers(ih, clean_peers)
+        elif got_bad_peer:
+            self.cnt['bm_some_bad_peers'] += 1
+            self.rt_adj_quality(nid, -1)
 
-    cdef void handle_query(self, tuple saddr, dict msg):
+        self.db_update_peers(ih, good_peers)
 
-        try:
-            tok = msg[b't']
-            method = msg[b'q']
-            args = msg[b'a']
-            nid = args[b'id']
-        except KeyError:
-            self.cnt['bm_q_bad_query'] += 1
-            return
+#     cdef void handle_new_peers(self, bytes nid, object vals):
+# 
+#         cdef:
+#             bytes ih
+#             list clean_peers = []
+# 
+#         try:
+#             ih_or_none = self.info_in_flight[nid]
+#             if ih_or_none is not None:
+#                 ih = ih_or_none[0]
+#             else:
+#                 self.cnt['err_peers_nid_invalidated'] += 1
+#                 return
+#         except KeyError:
+#             self.cnt['bm_nid_not_in_ifl'] += 1
+#             return
+# 
+#         if not isinstance(vals, list):
+#             self.cnt['bm_r_gp_bad_values'] += 1
+# 
+#         elif len(vals) == 0:
+#             self.cnt['bm_r_gp_empty_vals'] += 1
+# 
+#         else:
+#             for raw_peer in vals:
+#                 # IMPORTANT
+#                 if len(raw_peer) != PEERINFO_LEN:
+#                     self.cnt['bm_r_gp_bad_peer'] += 1
+#                     continue
+#                 ip, port = uncompact_peer_partial(raw_peer)
+#                 if not validate_ip(ip) or port == 0:
+#                     self.cnt['bm_r_gp_bad_peer'] += 1
+#                     continue
+#                 clean_peers.append((ip, port))
+# 
+#         if len(clean_peers) == 0:
+#             self.cnt['bm_r_gp_peers_dirty'] += 1
+#             # if any of the bad cases above happen, we want this node gone!
+#             self.rt_adj_quality(nid, -3)
+#             return
+# 
+#         self.db_update_peers(ih, clean_peers)
 
-        if len(nid) != 20:
-            self.cnt['bm_bad_nid'] += 1
-            return
+#     cdef void handle_query(self, tuple saddr, dict msg):
+# 
+#         try:
+#             tok = msg[b't']
+#             method = msg[b'q']
+#             args = msg[b'a']
+#             nid = args[b'id']
+#         except KeyError:
+#             self.cnt['bm_q_bad_query'] += 1
+#             return
+# 
+#         if len(nid) != 20:
+#             self.cnt['bm_bad_nid'] += 1
+#             return
+# 
+#         if method == b'find_node':
+#             self.cnt['rx_fn'] += 1
+#             try:
+#                 target = args[b'target']
+#             except KeyError:
+#                 self.cnt['bm_fn_no_target'] += 1
+#                 return
+# 
+#             # XXX
+#             pnode = self.rt_get_neighbor_nid(target)
+#             if pnode is not None:
+#                 self.send_q_fn(pnode, nid, tok, saddr)
+# 
+#         elif method == b'ping':
+#             self.cnt['rx_q_pg'] += 1
+#             self.send_r_pg(nid, tok, saddr)
+# 
+#         elif method == b'get_peers':
+#             self.cnt['rx_gp'] += 1
+#             try:
+#                 ih = args[b'info_hash']
+#             except KeyError:
+#                 self.cnt['bm_gp_no_ih'] += 1
+#                 return
+# 
+#             if len(ih) != 20:
+#                 self.cnt['bm_gp_bad_ih'] += 1
+#                 return
+# 
+#             if self.db_ihash_age(ih) > BASE_IHASH_REFRESH_AGE:
+#                 self.cnt['info_gp_hash_add'] += 1
+#                 self.naked_ihashes.appendleft(ih)
+#             else:
+#                 self.cnt['info_gp_hash_drop'] += 1
+# 
+#             # effectively samples a random node in the double-bytant
+#             # this is close to compliant behaviour
+#             pnode = self.rt_get_neighbor_nid(ih)
+#             if pnode is not None:
+#                 self.send_r_gp(pnode, nid, tok, saddr)
+# 
+#         elif method == b'announce_peer':
+#             self.cnt['rx_ap'] += 1
+#             try:
+#                 if args[b'token'] != TOKEN:
+#                     # ignore bad token peers
+#                     self.cnt['bm_ap_bad_token'] += 1
+#             except KeyError:
+#                 self.cnt['bm_ap_no_token'] += 1
+#                 return
+# 
+#             if b'implied_port' in args and args[b'implied_port'] == 1:
+#                 p_port = saddr[1]
+#             elif b'port' in args:
+#                 p_port = args[b'port']
+#             else:
+#                 self.cnt['bm_ap_inconsistent_port']
+#                 return
+# 
+#             try:
+#                 ih = args[b'info_hash']
+#                 if len(ih) != 20:
+#                     self.cnt['bm_ap_bad_ih'] += 1
+#                     return
+#             except KeyError:
+#                 self.cnt['bm_ap_no_ih'] += 1
+#                 return
+# 
+#             self.db_update_peers(ih, [(compact_ip(saddr[0]), p_port)])
+#             # ap reply is the same as ping
+#             self.send_r_pg(nid, tok, saddr)
+# 
+#         else:
+#             try:
+#                 send_s = method.decode('ascii')
+#             except UnicodeDecodeError:
+#                 send_s = str(method)
+#             self.cnt[f'bm_method_{send_s}'] += 1
 
-        if method == b'find_node':
-            self.cnt['rx_fn'] += 1
-            try:
-                target = args[b'target']
-            except KeyError:
-                self.cnt['bm_fn_no_target'] += 1
-                return
-
-            # XXX
-            pnode = self.rt_get_neighbor_nid(target)
-            if pnode is not None:
-                self.send_q_fn(pnode, nid, tok, saddr)
-
-        elif method == b'ping':
-            self.cnt['rx_pg'] += 1
-            self.send_r_pg(nid, tok, saddr)
-
-        elif method == b'get_peers':
-            self.cnt['rx_gp'] += 1
-            try:
-                ih = args[b'info_hash']
-            except KeyError:
-                self.cnt['bm_gp_no_ih'] += 1
-                return
-
-            if len(ih) != 20:
-                self.cnt['bm_gp_bad_ih'] += 1
-                return
-
-            if self.db_ihash_age(ih) > BASE_IHASH_REFRESH_AGE:
-                self.cnt['info_gp_hash_add'] += 1
-                self.naked_ihashes.appendleft(ih)
-            else:
-                self.cnt['info_gp_hash_drop'] += 1
-
-            # effectively samples a random node in the double-bytant
-            # this is close to compliant behaviour
-            pnode = self.rt_get_neighbor_nid(ih)
-            if pnode is not None:
-                self.send_r_gp(pnode, nid, tok, saddr)
-
-        elif method == b'announce_peer':
-            self.cnt['rx_ap'] += 1
-            try:
-                if args[b'token'] != TOKEN:
-                    # ignore bad token peers
-                    self.cnt['bm_ap_bad_token'] += 1
-            except KeyError:
-                self.cnt['bm_ap_no_token'] += 1
-                return
-
-            if b'implied_port' in args and args[b'implied_port'] == 1:
-                p_port = saddr[1]
-            elif b'port' in args:
-                p_port = args[b'port']
-            else:
-                self.cnt['bm_ap_inconsistent_port']
-                return
-
-            try:
-                ih = args[b'info_hash']
-                if len(ih) != 20:
-                    self.cnt['bm_ap_bad_ih'] += 1
-                    return
-            except KeyError:
-                self.cnt['bm_ap_no_ih'] += 1
-                return
-
-            self.db_update_peers(ih, [(compact_ip(saddr[0]), p_port)])
-            # ap reply is the same as ping
-            self.send_r_pg(nid, tok, saddr)
-
-        else:
-            try:
-                send_s = method.decode('ascii')
-            except UnicodeDecodeError:
-                send_s = str(method)
-            self.cnt[f'bm_method_{send_s}'] += 1
-
-    cdef void handle_response(self, tuple saddr, dict msg):
-        '''
-        Handles a fully bdecoded response dict.
-
-        Slower than the heuristic method, but exact.
-        '''
-
-        cdef:
-            int num_good_nodes
-
-        try:
-            resp = msg[b'r']
-            nid = resp[b'id']
-        except KeyError:
-            self.cnt['bm_bad_response'] += 1
-            return
-
-        if len(nid) != 20:
-            self.cnt['bm_bad_nid'] += 1
-            return
-
-        if b'token' in resp:
-            self.cnt['rx_gp_r'] += 1
-            # this only gives us closer nodes:
-            if b'values' in resp:
-                self.cnt['rx_gp_r_val'] += 1
-                self.handle_new_peers(nid, resp[b'values'])
-
-            # some responses have both values and nodes... who cares, we
-            # only want the values
-            elif b'nodes' in resp:
-                # ... first, use throw all the new nodes into the grinder
-                self.cnt['rx_gp_r_nod'] += 1
-                num_good_nodes = self.handle_new_nodes(resp[b'nodes'])
-                # ... then, if the query is still active, ask one of
-                # the closer nodes
-                ih_or_none = self.info_in_flight.get(nid)
-                if ih_or_none is not None:
-
-                    self._rtt_buf[self._rtt_buf_ix] =\
-                        monotonic() - ih_or_none[1]
-                    self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
-
-                    del self.info_in_flight[nid]
-                    ih = ih_or_none[0]
-
-                    if num_good_nodes > 0:
-                        # peel off the first node, which we check we have
-                        new_nid, daddr = uncompact_nodeinfo(resp[b'nodes'])
-                        self.send_q_gp(ih, new_nid, daddr)
-                        self.info_in_flight[new_nid] = (ih, monotonic())
-                        self.cnt['info_got_next_hop'] += 1
-                        self.rt_adj_quality(nid, 1)
-                    else:
-                        self.cnt['bm_gp_r_no_good_nodes'] += 1
-                        self.rt_adj_quality(nid, -2)
-                else:
-                    self.cnt['bm_gp_r_not_in_ifl']
-            else:
-                # nids that give garbage are downvoted
-                self.rt_adj_quality(nid, -1)
-                self.cnt['bm_gp_r_token_only'] += 1
-
-        elif b'nodes' in resp:
-            self.cnt['rx_fn_r'] += 1
-            self.handle_new_nodes(resp[b'nodes'])
-
-        else:
-            self.cnt['rx_other_r'] += 1
-
+#     cdef void handle_response(self, tuple saddr, dict msg):
+#         '''
+#         Handles a fully bdecoded response dict.
+# 
+#         Slower than the heuristic method, but exact.
+#         '''
+# 
+#         cdef:
+#             int num_good_nodes
+# 
+#         try:
+#             resp = msg[b'r']
+#             nid = resp[b'id']
+#         except KeyError:
+#             self.cnt['bm_bad_response'] += 1
+#             return
+# 
+#         if len(nid) != 20:
+#             self.cnt['bm_bad_nid'] += 1
+#             return
+# 
+#         if b'token' in resp:
+#             self.cnt['rx_r_gp'] += 1
+#             # this only gives us closer nodes:
+#             if b'values' in resp:
+#                 self.cnt['rx_r_gp_val'] += 1
+#                 self.handle_new_peers(nid, resp[b'values'])
+# 
+#             # some responses have both values and nodes... who cares, we
+#             # only want the values
+#             elif b'nodes' in resp:
+#                 # ... first, use throw all the new nodes into the grinder
+#                 self.cnt['rx_r_gp_nod'] += 1
+#                 num_good_nodes = self.handle_new_nodes(resp[b'nodes'])
+#                 # ... then, if the query is still active, ask one of
+#                 # the closer nodes
+#                 ih_or_none = self.info_in_flight.get(nid)
+#                 if ih_or_none is not None:
+# 
+#                     self._rtt_buf[self._rtt_buf_ix] =\
+#                         monotonic() - ih_or_none[1]
+#                     self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
+# 
+#                     del self.info_in_flight[nid]
+#                     ih = ih_or_none[0]
+# 
+#                     if num_good_nodes > 0:
+#                         # peel off the first node, which we check we have
+#                         new_nid, daddr = uncompact_nodeinfo(resp[b'nodes'])
+#                         self.send_q_gp(ih, new_nid, daddr)
+#                         self.info_in_flight[new_nid] = (ih, monotonic())
+#                         self.cnt['info_got_next_hop'] += 1
+#                         self.rt_adj_quality(nid, 1)
+#                     else:
+#                         self.cnt['bm_r_gp_no_good_nodes'] += 1
+#                         self.rt_adj_quality(nid, -2)
+#                 else:
+#                     self.cnt['bm_r_gp_not_in_ifl']
+#             else:
+#                 # nids that give garbage are downvoted
+#                 self.rt_adj_quality(nid, -1)
+#                 self.cnt['bm_r_gp_token_only'] += 1
+# 
+#         elif b'nodes' in resp:
+#             self.cnt['rx_r_fn'] += 1
+#             self.handle_new_nodes(resp[b'nodes'])
+# 
+#         else:
+#             self.cnt['rx_other_r'] += 1
+# 
     cdef void handle_msg(self, bytes d, tuple saddr):
 
         try:
             saddr = (saddr[0].encode('ascii'), saddr[1])
         except UnicodeEncodeError:
-            self.cnt['bm_bad_saddr']
+            self.cnt['bm_bad_saddr'] += 1
             return
 
-        try:
-            msg = bdecode(d)
-        except Exception:
-            self.cnt['bm_bdecode_error'] += 1
-            return
+        # try:
+        #     msg = bdecode(d)
+        # except Exception:
+        #     self.cnt['bm_bdecode_error'] += 1
+        #     return
 
-        cdef parsed_msg out
+        cdef parsed_msg krpc
         cdef bd_status status
+        cdef u16 ap_port
 
-        status = krpc_bdecode(d, &out)
+        status = krpc_bdecode(d, &krpc)
         self.cnt[f'st_{bd_status_names[status]}'] += 1
 
         if status != bd_status.NO_ERROR:
+            IF BD_TRACE:
+                if status == bd_status.FALLTHROUGH:
+                    print('')
+                    print(d)
+                    print('\n'.join(g_trace))
             return
 
-        if parsed_msg.method
+        if krpc.method == krpc_msg_type.Q_AP:
+            self.cnt['rx_q_ap'] += 1
+
+            if krpc.token_len != 1 or krpc.token[0] != TOKEN:
+                self.cnt['bm_ap_bad_token'] += 1
+                return
+
+            if krpc.ap_implied_port:
+                ap_port = <u16> saddr[1]
+            else:
+                ap_port = krpc.ap_port
+
+            self.db_update_peers(krpc.ih, [(compact_ip(saddr[0]), ap_port)])
+            self.send_r_pg(krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
+
+        elif krpc.method == krpc_msg_type.Q_FN:
+            self.cnt['rx_q_fn'] += 1
+            pnode = self.rt_get_neighbor_nid(krpc.target[0:IH_LEN])
+            self.send_r_fn(pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
+
+        elif krpc.method == krpc_msg_type.Q_GP:
+            self.cnt['rx_q_gp'] += 1
+            # FIXME this check is too slow, need to move to rolling bloom
+            # filters
+            if self.db_ihash_age(krpc.ih[0:IH_LEN]) > BASE_IHASH_REFRESH_AGE:
+                self.cnt['info_new_ihash_add'] += 1
+                self.naked_ihashes.appendleft(krpc.ih[0:IH_LEN])
+            else:
+                self.cnt['info_new_ihash_drop'] += 1
+
+            # FIXME: move away from bytes shuffling
+            pnode = self.rt_get_neighbor_nid(krpc.ih[0:IH_LEN])
+            if pnode is not None:
+                self.send_r_gp(pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
+
+        elif krpc.method == krpc_msg_type.Q_PG:
+            self.cnt['rx_q_pg'] += 1
+            self.send_r_pg(krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
+
+        elif krpc.method == krpc_msg_type.R_GP:
+            self.cnt['rx_r_gp'] += 1
+            if krpc.n_nodes > 0:
+                self.cnt['rx_r_gp_n'] += 1
+                self.handle_new_nodes(krpc.nodes, krpc.n_nodes)
+
+                # XXX fixme. this is the most common path, and is also the
+                # slowest
+                old_nid = krpc.nid[0:IH_LEN]
+                ih_or_none = self.info_in_flight.get(old_nid)
+
+                if ih_or_none is None:
+                    self.cnt['bm_unmatched_nodes'] += 1
+                    return
+
+                self._rtt_buf[self._rtt_buf_ix] = monotonic() - ih_or_none[1]
+                self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
+
+                target_ih = ih_or_none[0]
+
+                # FIXME check dkad delta
+                self.cnt['info_matched_nodes'] += 1
+                self.rt_adj_quality(old_nid, 1)
+
+                new_nid, new_daddr = uncompact_nodeinfo(
+                    krpc.nodes[0:NODEINFO_LEN])
+                self.send_q_gp(target_ih, new_nid, new_daddr)
+
+                del self.info_in_flight[old_nid]
+                self.info_in_flight[new_nid] = (target_ih, monotonic())
+
+            else:
+                if krpc.n_peers == 0:
+                    IF BD_TRACE:
+                            print('EMPTY PEERS IN R_GP')
+                            print(d)
+                            print('\n'.join(g_trace))
+                            return
+                    self.cnt['err_r_gp_empty_peers'] += 1
+
+                self.cnt['rx_r_gp_v'] += 1
+                self.handle_new_peers(krpc.nid, krpc.peers, krpc.n_peers)
+
+        elif krpc.method == krpc_msg_type.R_FN:
+            self.cnt['rx_r_fn'] += 1
+            if krpc.n_nodes == 0:
+                IF BD_TRACE:
+                    print('EMPTY NODES IN R_FN')
+                    print(d)
+                    print('\n'.join(g_trace))
+                    return
+                self.cnt['err_r_fn_empty_nodes'] += 1
+
+            self.handle_new_nodes(krpc.nodes, krpc.n_nodes)
+
+        elif krpc.method == krpc_msg_type.R_PG:
+            self.cnt['rx_r_pg'] += 1
+
+        else:
+            IF BD_TRACE:
+                print('HANDLE FALLTHROUGH')
+                print(d)
+                print('\n'.join(g_trace))
+            self.cnt['err_handle_fallthrough'] += 1
+
         # try:
         #     msg_type = msg[b'y']
         # except TypeError:
@@ -694,15 +819,15 @@ cdef class DHTScraper:
     cdef void send_sample_infohashes(self, bytes nid, tuple addr):
         pass
 
-    cdef void send_fn_random(self, u8 *nid, tuple addr):
-        self.send_fn(rbytes(IH_LEN), nid, addr)
+    cdef void send_r_fnandom(self, u8 *nid, tuple addr):
+        self.send_q_fn(rbytes(IH_LEN), nid, addr)
 
-    cdef void send_fn(self, u8 *target, u8 *nid, tuple addr):
+    cdef void send_q_fn(self, u8 *target, u8 *nid, tuple addr):
         '''
         Solicit a new random node based on our current self id and the current
         state
         '''
-        self.cnt['tx_fn'] += 1
+        self.cnt['tx_q_fn'] += 1
         self.listener.send_msg(
             (
                 b'd1:ad2:id20:' + mk_sid(nid) +
@@ -712,8 +837,8 @@ cdef class DHTScraper:
             addr, 0,
         )
 
-    cdef void send_q_fn(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
-        self.cnt['tx_fn_r'] += 1
+    cdef void send_r_fn(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
+        self.cnt['tx_r_fn'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) +
@@ -726,7 +851,7 @@ cdef class DHTScraper:
         pass
 
     cdef void send_q_pg(self, u8 *nid, tuple addr):
-        self.cnt['tx_pg'] += 1
+        self.cnt['tx_q_pg'] += 1
         self.listener.send_msg(
             b'd1:ad2:id20:' + mk_sid(nid) + b'e1:q4:ping1:t1:\x771:y1:qe',
             addr,
@@ -737,7 +862,7 @@ cdef class DHTScraper:
         '''
         Send a ping reply.
         '''
-        self.cnt['tx_pg_r'] += 1
+        self.cnt['tx_r_pg'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) + b'e1:t' +
@@ -751,7 +876,7 @@ cdef class DHTScraper:
         '''
         Send get_peers query.
         '''
-        self.cnt['tx_gp'] += 1
+        self.cnt['tx_q_gp'] += 1
         cdef bytes msg = (
             b'd1:ad2:id20:' + mk_sid(nid) +
             b'9:info_hash20:' + bytes(ih[0:IH_LEN]) +
@@ -766,7 +891,7 @@ cdef class DHTScraper:
         Includes one packed node of length 26.
         '''
 
-        self.cnt['tx_gp_r'] += 1
+        self.cnt['tx_r_gp'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) +
@@ -787,7 +912,7 @@ cdef class DHTScraper:
                 rnode = self.rt_get_random_node()
                 if rnode:
                     nid, addr = uncompact_nodeinfo(rnode)
-                    self.send_fn_random(nid, addr)
+                    self.send_r_fnandom(nid, addr)
                 break
 
             # try to get a node close to the infohash
@@ -800,13 +925,13 @@ cdef class DHTScraper:
                 rnode = self.rt_get_random_node()
                 if rnode:
                     nid, addr = uncompact_nodeinfo(rnode)
-                    self.send_fn(ih, nid, addr)
+                    self.send_q_fn(ih, nid, addr)
                 continue
 
             nid, daddr = uncompact_nodeinfo(packed_node)
 
             if nid in self.info_in_flight:
-                self.cnt['info_node_already_in_ifl']
+                self.cnt['info_node_already_in_ifl'] += 1
                 continue
 
             self.send_q_gp(ih, nid, daddr, prio=False)
@@ -829,7 +954,7 @@ cdef class DHTScraper:
             )
             # zero port means zero entry
             if addr[1] > 0:
-                self.send_fn_random(nid, addr)
+                self.send_r_fnandom(nid, addr)
 
         except KeyError:
             self.cnt['loop_fn_nodes_exchausted'] += 1
@@ -869,7 +994,7 @@ cdef class DHTScraper:
     def loop_boostrap(self):
         if self.apx_filled_rt_ratio() < 0.01:
             for addr in BOOTSTRAP:
-                self.send_fn_random(rbytes(IH_LEN), addr)
+                self.send_r_fnandom(rbytes(IH_LEN), addr)
 
     @aio_loop_method(SAVE_SLEEP, init_sleep=SAVE_SLEEP)
     def loop_save_data(self):
@@ -886,7 +1011,7 @@ cdef class DHTScraper:
         dcnt = self.cnt - self._ctl_cnt
         self._ctl_cnt = self.cnt.copy()
 
-        gprr = dcnt['rx_gp_r'] / (dcnt['tx_gp'] + 1)
+        gprr = dcnt['rx_r_gp'] / (dcnt['tx_q_gp'] + 1)
 
         if gprr < GPRR_FLOOR:
             self.ctl_ifl_target = max(self.ctl_ifl_target - 1, MIN_IFL_TARGET)
@@ -908,11 +1033,11 @@ cdef class DHTScraper:
         self._disp_cnt = self.cnt.copy()
 
         # get peers response rate
-        gprr = x["rx_gp_r"] / (x["tx_gp"] + 1)
+        gprr = x["rx_r_gp"] / (x["tx_q_gp"] + 1)
         # values to nodes ratio (in gp_response)
-        vnr = (x["rx_gp_r_val"] + 1) / (x["rx_gp_r_nod"] + 1)
+        vnr = (x["rx_r_gp_v"] + 1) / (x["rx_r_gp_n"] + 1)
         # db accept rate (number of new infohashes not in db already)
-        add, drop = x["info_gp_hash_add"] + 1, x["info_gp_hash_drop"] + 1
+        add, drop = x["info_new_ihash_add"] + 1, x["info_new_ihash_drop"] + 1
         newr = add / (add + drop)
 
         # get peers round trip time
@@ -925,14 +1050,14 @@ cdef class DHTScraper:
 
         info = (
             f'{format_uptime(int(monotonic() - self._start_time)):>9s} | '  # len 11
-            f'{x["rx_pg"]:>5d} '  # len 6
-            f'{x["rx_fn"]:>5d} {x["rx_fn_r"]:>5d} '  # len 12
-            f'{x["rx_gp"]:>5d} '  # len 12
-            f'{x["rx_gp_r_val"]:>5d} {x["rx_gp_r_nod"]:>5d} '
-            f'{x["rx_ap"]:>5d} | '  # len 11
-            f'{x["tx_fn"]:>5d} {x["tx_fn_r"]:>5d} {x["tx_gp"]:>5d} '  # len 14
-            f'{x["tx_gp_r"]:>5d} {x["tx_pg"]:>5d} '  # len 12
-            f'{x["tx_pg_r"]:>5d} | '  # len 6
+            f'{x["rx_q_pg"]:>5d} '  # len 6
+            f'{x["rx_q_fn"]:>5d} {x["rx_r_fn"]:>5d} '  # len 12
+            f'{x["rx_q_gp"]:>5d} '  # len 12
+            f'{x["rx_r_gp_v"]:>5d} {x["rx_r_gp_n"]:>5d} '
+            f'{x["rx_q_ap"]:>5d} | '  # len 11
+            f'{x["tx_q_fn"]:>5d} {x["tx_r_fn"]:>5d} {x["tx_q_gp"]:>5d} '  # len 14
+            f'{x["tx_r_gp"]:>5d} {x["tx_q_pg"]:>5d} '  # len 12
+            f'{x["tx_r_pg"]:>5d} | '  # len 6
             f'{x["info_db_ih_updates"]:>4d} {newr:4.2f} {lru:4.2f} | '  # len 17
             f'{min(gprr, 1.0):>4.2f} {self.ctl_ifl_target:>4d} {vnr:4.2f} '  # len 15
             f'{int(1000 * rtt.mean):>3d}±{int(1000 * rtt.std):>3d} | '  # len 10
@@ -951,11 +1076,11 @@ cdef class DHTScraper:
         header_low = (
             '  uptime  | '
             ' ping '
-            '   fn  fn_r '
+            '   fn  r_fn '
             '   gp '
             'gp_rv gp_rn '
             '   ap | '
-            '   fn  fn_r    gp '
+            '   fn  r_fn    gp '
             ' gp_r    pg  pg_r | '
             '  db newr  lru | '
             'gprr load  vnr '
@@ -969,6 +1094,9 @@ cdef class DHTScraper:
 
         LOG.info(info)
         self._info_iter = (self._info_iter + 1) % INFO_HEADER_EVERY
+
+        with open(INFO_FILE, 'w') as f:
+            f.write(self.format_detailed_info())
 
     def run(self):
         # XXX fixme cython time jitters all over the place on startup,
@@ -1000,17 +1128,15 @@ cdef class DHTScraper:
             self.loop.stop()
             self.loop.close()
 
-        sig.signal(sig.SIGTSTP, self.print_detailed_info)
+        # sig.signal(sig.SIGTSTP, self.format_detailed_info)
         # self.loop.add_signal_handler(sig.SIGINT, stop_all)
 
         self.loop.run_forever()
 
-    def print_detailed_info(self, signal, frame):
+    def format_detailed_info(self):
         '''
         Prints tables of detailed information on request.
         '''
-
-        self._info_iter = 0
 
         cdef int table_width = 35 + 12 + 3
 
@@ -1037,7 +1163,7 @@ cdef class DHTScraper:
 
             # append a divider and the contents of the smallest table
             # to the second smallest
-            sst.append(' ' + '-' * (25 + 12) + ' ')
+            sst.append(' ' + '-' * (35 + 12) + ' ')
             sst.extend(smt)
             
             # and delete the smallest
@@ -1053,14 +1179,11 @@ cdef class DHTScraper:
                 pad_table,
                 *[tables[k] for k in sorted(tables.keys())],
                 end_table,
-                fillvalue=' ' * 39,
+                fillvalue=' ' * (35 + 12 + 2),
             )
         ])
 
-        LOG.info(output_string)
-
-        # XXX hopefully this fixes the stupidity
-        os.kill(os.getpid(), sig.SIGCONT)
+        return output_string
 
     cdef void dump_data(self):
         cdef:

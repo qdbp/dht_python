@@ -6,48 +6,21 @@ from libc.stdlib cimport atoi
 from libc.string cimport memcmp, memset
 
 cimport cython
-from dht.bdecode_st cimport parsed_msg, bd_status
-from dht.bdecode_st cimport krpc_msg_type
+from dht.bdecode_st cimport parsed_msg, bd_status, krpc_msg_type
 
 from libc.stdint cimport uint8_t as u8, uint64_t as u64, uint16_t as u16, uint32_t as u32
 from libc.stdint cimport int64_t as i64
 from libc.string cimport memcpy
 # from libc.stdint cimport uint64_t as u64
 
-DEF IH_LEN = 20
-DEF PEERINFO_LEN = 6
-DEF NODEINFO_LEN = IH_LEN + PEERINFO_LEN
-
-DEF BD_MAXLEN = 4096
-DEF BD_MAXLEN_TOK = 32
-DEF BD_MAXLEN_TOKEN = 32
-DEF BD_MAX_PEERS = 36
-DEF BD_MAX_NODES = 8
-# find node
-DEF IKEY_VALUES = 1
-DEF IKEY_NODES = 1 << 1
-DEF IKEY_TOKEN = 1 << 2
-DEF IKEY_IH = 1 << 3
-DEF IKEY_NID = 1 << 4
-DEF IKEY_TARGET = 1 << 5
-DEF IKEY_IP = 1 << 6
-DEF IKEY_PORT = 1 << 7
-DEF OKEY_A = 1 << 8
-DEF OKEY_T = 1 << 9
-DEF OKEY_Q = 1 << 10
-DEF OKEY_R = 1 << 11
-DEF OKEY_Y = 1 << 12
-
-DEF IKEY_ANY_BODY =\
-    IKEY_NODES | IKEY_VALUES | IKEY_IH | IKEY_TARGET | IKEY_TOKEN
+include "dht.pxi"
 
 cdef R_ANY =        R_FN | R_GP | R_PG
 cdef Q_ANY = Q_AP | Q_FN | Q_GP | Q_PG
 
-DEF BD_TRACE = 0
-
 cdef:
-    dict METHOD_TAB = {
+    # FIXME: autogenerate from enum?
+    dict krpc_method_names = {
         Q_AP: 'Q_AP',
         Q_FN: 'Q_FN',
         Q_GP: 'Q_GP',
@@ -85,6 +58,7 @@ cdef:
         25: 'NAKED_VALUE',
         26: 'ERROR_TYPE',
         27: 'UNKNOWN_Q',
+        28: 'VALUES_WITHOUT_TOKEN',
     }
 
 cdef:
@@ -203,6 +177,9 @@ cdef inline void krpc_bdecode_s(
     actuall extracts useful data (which is all strings).
 
     The state setup by other functions was for the benefit of krpc_bdecode_s.
+
+    This is a lovable monstrosity. Be delicate with it. If you don't know what
+    something does, think 7 times before changing it, or you will feel pain.
     '''
     cdef:
         i64 slen, start
@@ -216,8 +193,8 @@ cdef inline void krpc_bdecode_s(
 
     # if reading the string would overflow, set the fail flag and unwind
     if maxlen < start + slen:
-        IF BD_TRACE: g_trace.append('string: overflow, FAIL')
         state.fail = BD_BUFFER_OVERFLOW
+        IF BD_TRACE: g_trace.append(f'FAIL: {state.fail}')
         return
 
     ix[0] += slen
@@ -249,44 +226,44 @@ cdef inline void krpc_bdecode_s(
                 # if we get a response key, we don't set a current key
                 # but we no longer expect a q key or r key
                 if data[start] == 97:  # b'a'
-                    if state.seen_keys & OKEY_R:
+                    if state.seen_keys & BD_OKEY_R:
                         state.fail = INCONSISTENT_TYPE
                         return
                     # state.legal_kinds &= Q_ANY
-                    IF BD_TRACE: g_trace.append('matched okey "a"')
+                    IF BD_TRACE: g_trace.append('>>> matched okey "a"')
                     state.msg_kind &= Q_ANY
-                    state.current_key = OKEY_A
-                    state.seen_keys |= OKEY_A
+                    state.current_key = BD_OKEY_A
+                    state.seen_keys |= BD_OKEY_A
 
                 # similarly, if we get an r key, we no longer expect a, or q
                 elif data[start] == 114: # b'r'
-                    if state.seen_keys & (OKEY_A | OKEY_Q):
+                    if state.seen_keys & (BD_OKEY_A | BD_OKEY_Q):
                         state.fail = INCONSISTENT_TYPE
                         return
-                    IF BD_TRACE: g_trace.append('matched okey "r"')
+                    IF BD_TRACE: g_trace.append('>>> matched okey "r"')
                     state.msg_kind &= R_ANY
-                    state.current_key = OKEY_R
-                    state.seen_keys |= OKEY_R
+                    state.current_key = BD_OKEY_R
+                    state.seen_keys |= BD_OKEY_R
 
                 # if we get a t key, we set the current key to tok
                 elif data[start] == 116:  # b't':
-                    IF BD_TRACE: g_trace.append('matched okey "t"')
-                    state.current_key = OKEY_T
-                    state.seen_keys |= OKEY_T
+                    IF BD_TRACE: g_trace.append('>>> matched okey "t"')
+                    state.current_key = BD_OKEY_T
+                    state.seen_keys |= BD_OKEY_T
 
                 elif data[start] == 113:  # b'q':
-                    if state.seen_keys & OKEY_R:
+                    if state.seen_keys & BD_OKEY_R:
                         state.fail = INCONSISTENT_TYPE
                         return
-                    IF BD_TRACE: g_trace.append('matched okey "q"')
+                    IF BD_TRACE: g_trace.append('>>> matched okey "q"')
                     state.msg_kind &= Q_ANY
-                    state.current_key = OKEY_Q
-                    state.seen_keys |= OKEY_Q
+                    state.current_key = BD_OKEY_Q
+                    state.seen_keys |= BD_OKEY_Q
 
                 elif data[start] == 121:  # b'y'
-                    IF BD_TRACE: g_trace.append('matched okey "y"')
-                    state.seen_keys |= OKEY_Y
-                    state.current_key = OKEY_Y
+                    IF BD_TRACE: g_trace.append('>>> matched okey "y"')
+                    state.seen_keys |= BD_OKEY_Y
+                    state.current_key = BD_OKEY_Y
 
             # else we do nothing, ignoring depth one keys of slen != 1
 
@@ -298,73 +275,74 @@ cdef inline void krpc_bdecode_s(
             if slen == bdk_NID_slen and\
                     0 == memcmp(data + start, bdk_NID, slen):
 
-                IF BD_TRACE: g_trace.append('saw nid key')
-                state.current_key = IKEY_NID
-                state.seen_keys |= IKEY_NID
+                IF BD_TRACE: g_trace.append('>>> matched ikey NID')
+                state.current_key = BD_IKEY_NID
+                state.seen_keys |= BD_IKEY_NID
 
             elif slen == bdk_IH_slen and\
                     0 == memcmp(data + start, bdk_IH, slen):
 
-                IF BD_TRACE: g_trace.append('saw ih key')
+                IF BD_TRACE: g_trace.append('>>> matched ikey IH')
                 state.msg_kind &= (Q_GP | Q_AP)
-                state.current_key = IKEY_IH
-                state.seen_keys |= IKEY_IH
+                state.current_key = BD_IKEY_IH
+                state.seen_keys |= BD_IKEY_IH
 
             elif slen == bdk_NODES_slen and\
                     0 == memcmp(data + start, bdk_NODES, slen):
 
-                IF BD_TRACE: g_trace.append('saw nodes key')
+                IF BD_TRACE: g_trace.append('>>> matched ikey NODES')
                 state.msg_kind &= (R_FN | R_GP)
-                state.current_key = IKEY_NODES
-                state.seen_keys |= IKEY_NODES
+                state.current_key = BD_IKEY_NODES
+                state.seen_keys |= BD_IKEY_NODES
 
             elif slen == bdk_VALUES_slen and\
                     0 == memcmp(data + start, bdk_VALUES, slen):
 
-                IF BD_TRACE: g_trace.append('saw values key')
+                IF BD_TRACE: g_trace.append('>>> saw ikey VALUES')
                 state.msg_kind &= R_GP
-                state.current_key = IKEY_VALUES
-                state.seen_keys |= IKEY_VALUES
+                state.current_key = BD_IKEY_VALUES
+                state.seen_keys |= BD_IKEY_VALUES
 
             elif slen == bdk_TOKEN_slen and\
                     0 == memcmp(data + start, bdk_TOKEN, slen):
 
-                IF BD_TRACE: g_trace.append('saw token key')
-                # NOTE many gp queries include a token, we allow for it
-                state.msg_kind &= (Q_AP | R_GP | Q_GP)
-                state.current_key = IKEY_TOKEN
-                state.seen_keys |= IKEY_TOKEN
+                IF BD_TRACE: g_trace.append('>>> matched ikey TOKEN')
+                # NOTE many random queries include a token, we allow for it
+                # state.msg_kind &= (Q_AP | R_GP | Q_GP)
+                state.current_key = BD_IKEY_TOKEN
+                state.seen_keys |= BD_IKEY_TOKEN
 
             elif slen == bdk_TARGET_slen and\
                     0 == memcmp(data + start, bdk_TARGET, slen):
 
-                IF BD_TRACE: g_trace.append('saw target key')
+                IF BD_TRACE: g_trace.append('>>> matchec ikey TARGET')
                 state.msg_kind &= Q_FN
-                state.current_key = IKEY_TARGET
-                state.seen_keys |= IKEY_TARGET
+                state.current_key = BD_IKEY_TARGET
+                state.seen_keys |= BD_IKEY_TARGET
 
             elif slen == bdk_PORT_slen and\
                     0 == memcmp(data + start, bdk_PORT, slen):
 
                 # we do not restrict the legal kinds, since other
                 # messages can have a port as extra data we ignore
-                IF BD_TRACE: g_trace.append('saw port key')
-                state.seen_keys |= IKEY_PORT
+                IF BD_TRACE: g_trace.append('>>> matched ikey PORT')
+                state.seen_keys |= BD_IKEY_PORT
                 state.save_ap_port = 1
 
             elif slen == bdk_IP_slen and\
                     0 == memcmp(data + start, bdk_IP, slen):
 
-                IF BD_TRACE: g_trace.append('saw implied_port key')
+                IF BD_TRACE: g_trace.append('>>> matched ikey IMPLIED_PORT')
                 state.msg_kind &= Q_AP
-                state.current_key = IKEY_IP
-                state.seen_keys |= IKEY_IP
+                state.current_key = BD_IKEY_IP
+                state.seen_keys |= BD_IKEY_IP
 
             # else nothing, ignore all other keys
 
         # no KRPC dicts should have a depth more than 2:
         # fail instantly if we see this
         else:
+            # XXX :^) 
             state.fail = DICTS_TOO_DEEP
             IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
             return
@@ -375,47 +353,49 @@ cdef inline void krpc_bdecode_s(
         if state.dict_depth == 1:
             IF BD_TRACE: g_trace.append(f'depth 1')
             # set the query type, if one is found...
-            if state.current_key == OKEY_Q:
+            if state.current_key == BD_OKEY_Q:
                 if slen == bdv_AP_slen and\
                         0 == memcmp(data + start, bdv_AP, slen):
 
                     state.msg_kind &= Q_AP
-                    IF BD_TRACE: g_trace.append(f'>>> q is Q_AP')
+                    IF BD_TRACE: g_trace.append(f'!!! q is Q_AP')
 
                 elif slen == bdv_FN_slen and\
                         0 == memcmp(data + start, bdv_FN, slen):
 
                     state.msg_kind &= Q_FN
-                    IF BD_TRACE: g_trace.append(f'>>> q is Q_FN')
+                    IF BD_TRACE: g_trace.append(f'!!! q is Q_FN')
 
                 elif slen == bdv_GP_slen and\
                         0 == memcmp(data + start, bdv_GP, slen):
 
                     state.msg_kind &= Q_GP
-                    IF BD_TRACE: g_trace.append(f'>>> q is Q_GP')
+                    IF BD_TRACE: g_trace.append(f'!!! q is Q_GP')
 
                 elif slen == bdv_PG_slen and\
                         0 == memcmp(data + start, bdv_PG, slen):
 
                     state.msg_kind &= Q_PG
-                    IF BD_TRACE: g_trace.append(f'>>> q is Q_PG')
+                    IF BD_TRACE: g_trace.append(f'!!! q is Q_PG')
                 # ... reject martian queries
                 else:
                     state.fail = UNKNOWN_Q
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
             # set the token...
-            elif state.current_key == OKEY_T:
+            elif state.current_key == BD_OKEY_T:
                 # if it's short enough
                 if slen > BD_MAXLEN_TOK:
                     state.fail = TOK_TOO_LONG
                     IF BD_TRACE: g_trace.append(f'bad tok, fail {state.fail}')
                 else:
-                    IF BD_TRACE: g_trace.append(f'tok[{slen}] = {data[start:ix[0]]}')
+                    IF BD_TRACE: g_trace.append(
+                        f'!!! TOK[{slen}] = {data[start:ix[0]]}'
+                    )
                     out.tok_len = slen
                     memcpy(out.tok, data + start, slen)
 
-            elif state.current_key == OKEY_Y:
-                if slen == 1 and data[start] == 101:
+            elif state.current_key == BD_OKEY_Y:
+                if slen == 1 and data[start] == 101:  # ord('e')
                     state.fail = ERROR_TYPE
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
 
@@ -424,7 +404,7 @@ cdef inline void krpc_bdecode_s(
         elif state.dict_depth == 2:
             IF BD_TRACE: g_trace.append(f'depth 2')
         # within a list, we expect only value strings
-            if state.current_key == IKEY_VALUES and state.list_depth == 1:
+            if state.current_key == BD_IKEY_VALUES and state.list_depth == 1:
                 # we are in a values list, but we read a weird string
                 # NOTE we assume the entire message is corrupted and bail out,
                 # in principle XXX we could just skip this peer
@@ -437,11 +417,11 @@ cdef inline void krpc_bdecode_s(
                         data + start,
                         PEERINFO_LEN)
                     out.n_peers += 1
-                    IF BD_TRACE: g_trace.append(f'{out.n_peers}th peer')
+                    IF BD_TRACE: g_trace.append(f'!!! {out.n_peers}th peer')
 
-            elif state.current_key == IKEY_NODES:
+            elif state.current_key == BD_IKEY_NODES:
                 # if the nodes array length is weird, or too long, fail
-                if slen % 26 != 0:
+                if (slen == 0) or (slen % NODEINFO_LEN != 0):
                     state.fail = BAD_LENGTH_NODES
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
@@ -449,51 +429,51 @@ cdef inline void krpc_bdecode_s(
                 if slen > (NODEINFO_LEN * BD_MAX_NODES):
                     IF BD_TRACE:
                         g_trace.append(
-                            f'truncating nodes {slen} to '
+                            f'??? Truncating nodes {slen} to '
                             f'{NODEINFO_LEN * BD_MAX_NODES}'
                         )
                     slen = NODEINFO_LEN * BD_MAX_NODES
 
-                IF BD_TRACE: g_trace.append(f'nodes[{slen//26}]')
-                out.n_nodes = slen // 26
+                IF BD_TRACE: g_trace.append(f'!!! NODES[{slen//26}] = ...')
+                out.n_nodes = slen // NODEINFO_LEN
                 memcpy(out.nodes, data + start, slen)
 
-            elif state.current_key == IKEY_TOKEN:
+            elif state.current_key == BD_IKEY_TOKEN:
                 if slen > BD_MAXLEN_TOKEN:
                     state.fail = TOKEN_TOO_LONG
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
                 else:
                     memcpy(out.token, data + start, slen)
-                    IF BD_TRACE: g_trace.append(f'token[{slen}] = {data[start:ix[0]]}')
+                    IF BD_TRACE: g_trace.append(f'!!! TOKEN[{slen}] = ...')
                     out.token_len = slen
 
-            elif state.current_key == IKEY_TARGET:
-                if slen != 20:
+            elif state.current_key == BD_IKEY_TARGET:
+                if slen != IH_LEN:
                     state.fail = BAD_LENGTH_TARGET
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
                 else:
-                    IF BD_TRACE: g_trace.append(f'target[{slen}] = {data[start:ix[0]]}')
+                    IF BD_TRACE: g_trace.append(f'!!! TARGET[{slen}] = {data[start:ix[0]]}')
                     memcpy(out.target, data + start, slen)
 
-            elif state.current_key == IKEY_NID:
-                if slen != 20:
+            elif state.current_key == BD_IKEY_NID:
+                if slen != IH_LEN:
                     state.fail = BAD_LENGTH_NID
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
                 else:
                     memcpy(out.nid, data + start, slen)
-                    IF BD_TRACE: g_trace.append('got nid')
+                    IF BD_TRACE: g_trace.append('!!! NID')
 
-            elif state.current_key == IKEY_IH:
-                if slen != 20:
+            elif state.current_key == BD_IKEY_IH:
+                if slen != IH_LEN:
                     state.fail = BAD_LENGTH_IH
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
                 else:
                     memcpy(out.ih, data + start, slen)
-                    IF BD_TRACE: g_trace.append('got ih')
+                    IF BD_TRACE: g_trace.append('!!! IH')
 
         else:
             state.fail = DICTS_TOO_DEEP
@@ -582,7 +562,6 @@ cdef inline void krpc_bdecode_e(
     ix[0] += 1
     return
 
-
 cdef:
     void (*g_krpc_dispatch_table[256])(u8*, u64*, u64, bd_state*, parsed_msg*)
     cdef i64 ix
@@ -646,8 +625,8 @@ cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
     state.list_depth = 0
     state.at_end = 0
 
-    # state.await_ki = IKEY_NID | IKEY_IH | IKEY_NODES | IKEY_VALUES | IKEY_TOKEN
-    # state.await_ko = OKEY_A | OKEY_Q | OKEY_R | OKEY_T | OKEY_Y
+    # state.await_ki = BD_IKEY_NID | BD_IKEY_IH | BD_IKEY_NODES | BD_IKEY_VALUES | BD_IKEY_TOKEN
+    # state.await_ko = BD_OKEY_A | BD_OKEY_Q | BD_OKEY_R | BD_OKEY_T | BD_OKEY_Y
     # state.await_q_type = Q_TYPE_AP | Q_TYPE_FN | Q_TYPE_GP | Q_TYPE_PG
 
     state.current_key = 0
@@ -663,87 +642,126 @@ cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
         return state.fail
 
     # ALL messages need a NID
-    if not state.seen_keys & IKEY_NID:
+    if not state.seen_keys & BD_IKEY_NID:
         return NO_NID
 
-    if not state.seen_keys & OKEY_T:
+    if not state.seen_keys & BD_OKEY_T:
         return NO_TOK
 
     if not state.msg_kind:
         return UNKNOWN_QUERY
 
-    # sort queries with tokens
-    if state.seen_keys & IKEY_TOKEN:
-        if not state.seen_keys & IKEY_IH:
-            state.msg_kind &= ~(Q_GP)
-        elif not state.seen_keys & (IKEY_NODES | IKEY_TARGET):
+    IF BD_TRACE: g_trace.append(
+        f'??? DECIDING keys {state.seen_keys:b} methods {state.msg_kind:b}',
+    )
+
+    # do method elimination
+    if state.seen_keys & BD_IKEY_TOKEN:
+
+        if not state.seen_keys & (BD_IKEY_NODES | BD_IKEY_VALUES):
+            IF BD_TRACE: g_trace.append(
+                '??? k_token && ~(k_nodes | k_values) -> ~r_gp'
+            )
             state.msg_kind &= ~(R_GP)
-        else:
-            IF BD_TRACE: g_trace.append('REJECT tokens && ~[ih or (n | v)]')
-            return UNKNOWN_QUERY
+
+        if not state.seen_keys & BD_IKEY_IH:
+            IF BD_TRACE: g_trace.append(
+                '??? ~k_ih && k_token -> ~q_gp'
+            )
+            state.msg_kind &= ~(Q_GP)
 
     # exact APs and GPs need an info_hash only
-    elif state.msg_kind == Q_AP or state.msg_kind == Q_GP:
-        if not state.seen_keys & IKEY_IH:
-            IF BD_TRACE: g_trace.append('REJECT (q_gp | q_ap) && ~ih')
+    if state.msg_kind == Q_AP or state.msg_kind == Q_GP:
+        if not state.seen_keys & BD_IKEY_IH:
+            IF BD_TRACE: g_trace.append(
+                '=== REJECT (q_gp | q_ap) && ~ih'
+            )
             return BK_APGP_NO_IH
+
         elif state.msg_kind == Q_AP and not\
-                state.seen_keys & (IKEY_PORT | IKEY_IP):
-            IF BD_TRACE: g_trace.append('REJECT q_ap && ~(port | ip)')
+                state.seen_keys & (BD_IKEY_PORT | BD_IKEY_IP):
+            IF BD_TRACE: g_trace.append(
+                '=== REJECT q_ap && ~(port | ip)'
+            )
             return BK_AP_NO_PORT
         else:
             out.method = <krpc_msg_type> state.msg_kind
+            IF BD_TRACE: g_trace.append(
+                f'=== ACCEPT {krpc_method_names[state.msg_kind]}')
             return NO_ERROR
 
     # fns need a target
     elif state.msg_kind == Q_FN:
-        if not state.seen_keys & IKEY_TARGET:
-            IF BD_TRACE: g_trace.append('REJECT q_fn && ~target')
+        if not state.seen_keys & BD_IKEY_TARGET:
+            IF BD_TRACE: g_trace.append('=== REJECT q_fn && ~target')
             return BK_FN_NO_TARGET
         else:
+            IF BD_TRACE: g_trace.append('=== ACCEPT Q_FN')
             out.method = Q_FN
             return NO_ERROR
 
     # accept only simple pings
     elif state.msg_kind == Q_PG:
-        if state.seen_keys & IKEY_ANY_BODY:
-            IF BD_TRACE: g_trace.append('REJECT q_pg && body')
+        if state.seen_keys & BD_IKEY_ANY_BODY:
+            IF BD_TRACE: g_trace.append('=== REJECT q_pg && body')
             return BK_PING_BODY
         else:
+            IF BD_TRACE: g_trace.append('=== ACCEPT Q_PG')
             out.method = Q_PG
             return NO_ERROR
 
     elif state.msg_kind & Q_ANY:
-        IF BD_TRACE: g_trace.append('REJECT fallthrough q_any')
+        IF BD_TRACE: g_trace.append('=== REJECT fallthrough q_any')
         return UNKNOWN_QUERY
 
     elif state.msg_kind & R_ANY:
+        IF BD_TRACE: g_trace.append('??? DECIDING as reply')
         # get_peers reply have a token...
-        if state.seen_keys & IKEY_TOKEN:
-            # but if they have neither nodes nor values, reject them
-            if not state.seen_keys & (IKEY_VALUES | IKEY_NODES):
+        if state.seen_keys & BD_IKEY_TOKEN and\
+                state.seen_keys & (BD_IKEY_VALUES | BD_IKEY_NODES):
+            IF BD_TRACE: g_trace.append(
+                '??? token & (nodes | values) -> r_gp'
+            )
+            out.method = R_GP
+            if out.n_nodes + out.n_peers == 0:
+                IF BD_TRACE: g_trace.append(
+                    '=== REJECT r_gp && (n + v) == 0'
+                )
                 return BK_EMPTY_GP_RESPONSE
-            else:
-                out.method = R_GP
-                return NO_ERROR
+            IF BD_TRACE: g_trace.append('ACCEPT R_GP')
 
-        elif state.seen_keys & IKEY_NODES:
+        elif state.seen_keys & BD_IKEY_VALUES and\
+                not state.seen_keys & BD_IKEY_TOKEN:
+            IF BD_TRACE: g_trace.append(
+                '=== REJECT values && ~token'
+            )
+            return VALUES_WITHOUT_TOKEN
+
+        elif state.seen_keys & BD_IKEY_NODES:
+            IF BD_TRACE: g_trace.append(
+                '=== ACCEPT ~[token & (nodes | values)] && nodes -> R_FN'
+            )
             out.method = R_FN
             return NO_ERROR
 
-        elif not (state.seen_keys & IKEY_ANY_BODY):
+        elif not (state.seen_keys & BD_IKEY_ANY_NON_TOKEN_BODY):
+            IF BD_TRACE: g_trace.append(
+                '=== ACCEPT ~(values | nodes) -> R_PG')
             out.method = R_PG
             return NO_ERROR
 
         else:
+            IF BD_TRACE: g_trace.append('=== REJECT UNKNOWN RESPONSE')
             return UNKNOWN_RESPONSE
     
     else:
-        return ERR_FALLTHROUGH
+        IF BD_TRACE:
+            g_trace.append('REJECT FALLTHROUGH')
+        return FALLTHROUGH
 
 cdef void print_parsed_msg(parsed_msg *out):
 
-    print(f'\tMETH = {METHOD_TAB[out.method]}')
+    print(f'\tMETH = {krpc_method_names[out.method]}')
     print(f'\tTOK[{out.token_len}] = "{out.tok[0:out.token_len]}"')
     print(f'\tNID[20] = "{out.nid[0:20]}"')
 

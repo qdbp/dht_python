@@ -1,15 +1,9 @@
 from libc.stdint cimport uint8_t as u8, uint64_t as u64, uint16_t as u16
 
-DEF IH_LEN = 20
-DEF PEERINFO_LEN = 6
-DEF NODEINFO_LEN = IH_LEN + PEERINFO_LEN
+include "dht.pxi"
 
-DEF BD_MAXLEN = 4096
-DEF BD_MAXLEN_TOK = 32
-DEF BD_MAXLEN_TOKEN = 32
-DEF BD_MAX_PEERS = 32
-DEF BD_MAX_NODES = 8
-
+# XXX the redeclared shit appears to be a cython error and doesn't affect
+# functionality... let's hope it goes away
 cdef:
     enum bd_status:
         NO_ERROR = 0
@@ -36,24 +30,26 @@ cdef:
         BK_FN_NO_TARGET = 21
         BK_PING_BODY = 22
         NO_TOK = 23
-        ERR_FALLTHROUGH = 24
+        FALLTHROUGH = 24
         NAKED_VALUE = 25
         ERROR_TYPE = 26
         UNKNOWN_Q = 27
+        VALUES_WITHOUT_TOKEN = 28
 
     enum krpc_msg_type:
         Q_AP = 1
         Q_FN = 1 << 1
         Q_GP = 1 << 2
         Q_PG = 1 << 3
-        
+        # R_AP 
         R_FN = 1 << 5
         R_GP = 1 << 6
         R_PG = 1 << 7
 
     struct parsed_msg:
-        # self explanatory
+        # type of message, from among recognized ones
         krpc_msg_type method
+        # mandatory fields
         u8 nid[IH_LEN]
         u8 ih[IH_LEN]
         u8 target[IH_LEN]
