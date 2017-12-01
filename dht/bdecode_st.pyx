@@ -13,7 +13,28 @@ from libc.stdint cimport int64_t as i64
 from libc.string cimport memcpy
 # from libc.stdint cimport uint64_t as u64
 
-include "dht.pxi"
+include "dht_h.pxi"
+
+DEF BD_IKEY_VALUES = 1
+DEF BD_IKEY_NODES = 1 << 1
+DEF BD_IKEY_TOKEN = 1 << 2
+DEF BD_IKEY_IH = 1 << 3
+DEF BD_IKEY_NID = 1 << 4
+DEF BD_IKEY_TARGET = 1 << 5
+DEF BD_IKEY_IP = 1 << 6
+DEF BD_IKEY_PORT = 1 << 7
+DEF BD_IKEY_AP_NAME = 1 << 8
+DEF BD_OKEY_A = 1 << 9
+DEF BD_OKEY_T = 1 << 10
+DEF BD_OKEY_Q = 1 << 11
+DEF BD_OKEY_R = 1 << 12
+DEF BD_OKEY_Y = 1 << 13
+
+DEF BD_IKEY_ANY_BODY =\
+    BD_IKEY_NODES | BD_IKEY_VALUES | BD_IKEY_IH | BD_IKEY_TARGET | BD_IKEY_TOKEN
+
+DEF BD_IKEY_ANY_NON_TOKEN_BODY =\
+    BD_IKEY_NODES | BD_IKEY_VALUES | BD_IKEY_IH | BD_IKEY_TARGET
 
 cdef R_ANY =        R_FN | R_GP | R_PG
 cdef Q_ANY = Q_AP | Q_FN | Q_GP | Q_PG
@@ -95,6 +116,8 @@ cdef:
     u64 bdk_IH_slen = 9
     u8 *bdk_IP = b'implied_port'
     u64 bdk_IP_slen = 12
+    u8 *bdk_AP_NAME = b'name'
+    u64 bdk_AP_NAME_slen = 4
 
     u8 *bdv_AP = b'announce_peer'
     u64 bdv_AP_slen = 13
@@ -222,7 +245,6 @@ cdef inline void krpc_bdecode_s(
             # all outer keys have length 1, can check it off the bat
             if slen == 1:
                 # "string comparison" of a single bytes is just integer comparison
-
                 # if we get a response key, we don't set a current key
                 # but we no longer expect a q key or r key
                 if data[start] == 97:  # b'a'
@@ -264,9 +286,9 @@ cdef inline void krpc_bdecode_s(
                     IF BD_TRACE: g_trace.append('>>> matched okey "y"')
                     state.seen_keys |= BD_OKEY_Y
                     state.current_key = BD_OKEY_Y
-
-            # else we do nothing, ignoring depth one keys of slen != 1
-
+                else:
+                    pass
+        # READ KEYS DEPTH 2
         elif state.dict_depth == 2:
             IF BD_TRACE: g_trace.append(f'depth 2')
             # XXX you could put this in a for loop to DRY it up... but this
@@ -275,14 +297,15 @@ cdef inline void krpc_bdecode_s(
             if slen == bdk_NID_slen and\
                     0 == memcmp(data + start, bdk_NID, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matched ikey NID')
+                IF BD_TRACE: g_trace.append('>>> matched ikey ID; * -> *')
                 state.current_key = BD_IKEY_NID
                 state.seen_keys |= BD_IKEY_NID
 
             elif slen == bdk_IH_slen and\
                     0 == memcmp(data + start, bdk_IH, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matched ikey IH')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey INFO_HASH; * -> Q_AP|Q_GP')
                 state.msg_kind &= (Q_GP | Q_AP)
                 state.current_key = BD_IKEY_IH
                 state.seen_keys |= BD_IKEY_IH
@@ -290,7 +313,8 @@ cdef inline void krpc_bdecode_s(
             elif slen == bdk_NODES_slen and\
                     0 == memcmp(data + start, bdk_NODES, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matched ikey NODES')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey NODES; * -> R_FN|R_GP')
                 state.msg_kind &= (R_FN | R_GP)
                 state.current_key = BD_IKEY_NODES
                 state.seen_keys |= BD_IKEY_NODES
@@ -298,7 +322,8 @@ cdef inline void krpc_bdecode_s(
             elif slen == bdk_VALUES_slen and\
                     0 == memcmp(data + start, bdk_VALUES, slen):
 
-                IF BD_TRACE: g_trace.append('>>> saw ikey VALUES')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey VALUES; * -> R_GP')
                 state.msg_kind &= R_GP
                 state.current_key = BD_IKEY_VALUES
                 state.seen_keys |= BD_IKEY_VALUES
@@ -306,7 +331,9 @@ cdef inline void krpc_bdecode_s(
             elif slen == bdk_TOKEN_slen and\
                     0 == memcmp(data + start, bdk_TOKEN, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matched ikey TOKEN')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey TOKEN; * -> *'
+                )
                 # NOTE many random queries include a token, we allow for it
                 # state.msg_kind &= (Q_AP | R_GP | Q_GP)
                 state.current_key = BD_IKEY_TOKEN
@@ -315,7 +342,8 @@ cdef inline void krpc_bdecode_s(
             elif slen == bdk_TARGET_slen and\
                     0 == memcmp(data + start, bdk_TARGET, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matchec ikey TARGET')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey TARGET; * -> Q_FN')
                 state.msg_kind &= Q_FN
                 state.current_key = BD_IKEY_TARGET
                 state.seen_keys |= BD_IKEY_TARGET
@@ -332,13 +360,25 @@ cdef inline void krpc_bdecode_s(
             elif slen == bdk_IP_slen and\
                     0 == memcmp(data + start, bdk_IP, slen):
 
-                IF BD_TRACE: g_trace.append('>>> matched ikey IMPLIED_PORT')
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey IMPLIED_PORT; * -> Q_AP'
+                )
                 state.msg_kind &= Q_AP
                 state.current_key = BD_IKEY_IP
                 state.seen_keys |= BD_IKEY_IP
 
-            # else nothing, ignore all other keys
+            # ignore name field in non-announce peer messages
+            elif slen == bdk_AP_NAME_slen and\
+                    state.msg_kind & Q_AP and\
+                    0 == memcmp(data + start, bdk_AP_NAME, slen):
 
+                IF BD_TRACE: g_trace.append(
+                    '>>> matched ikey NAME; ~Q_AP -> Q_AP')
+                state.msg_kind = Q_AP
+                state.current_key = BD_IKEY_AP_NAME
+                state.seen_keys |= BD_IKEY_AP_NAME
+            else:
+                pass
         # no KRPC dicts should have a depth more than 2:
         # fail instantly if we see this
         else:
@@ -347,11 +387,10 @@ cdef inline void krpc_bdecode_s(
             IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
             return
 
-    # not state.reading_dict_key -> reading a (possibly nested value)
+    # READ VALUES
     else:
-        IF BD_TRACE: g_trace.append(f'reading value')
         if state.dict_depth == 1:
-            IF BD_TRACE: g_trace.append(f'depth 1')
+            IF BD_TRACE: g_trace.append(f'READ VALUES DEPTH 1')
             # set the query type, if one is found...
             if state.current_key == BD_OKEY_Q:
                 if slen == bdv_AP_slen and\
@@ -398,26 +437,29 @@ cdef inline void krpc_bdecode_s(
                 if slen == 1 and data[start] == 101:  # ord('e')
                     state.fail = ERROR_TYPE
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
-
-            # else do nothing special for other okeys
+            else:
+                pass
 
         elif state.dict_depth == 2:
-            IF BD_TRACE: g_trace.append(f'depth 2')
-        # within a list, we expect only value strings
-            if state.current_key == BD_IKEY_VALUES and state.list_depth == 1:
-                # we are in a values list, but we read a weird string
-                # NOTE we assume the entire message is corrupted and bail out,
-                # in principle XXX we could just skip this peer
-                if slen != PEERINFO_LEN:
-                    state.fail = BAD_LENGTH_PEER
-                    IF BD_TRACE: g_trace.append(f'fail {state.fail}')
-                if out.n_peers < BD_MAX_PEERS:
-                    memcpy(
-                        out.peers + (PEERINFO_LEN * out.n_peers),
-                        data + start,
-                        PEERINFO_LEN)
-                    out.n_peers += 1
-                    IF BD_TRACE: g_trace.append(f'!!! {out.n_peers}th peer')
+            IF BD_TRACE: g_trace.append(f'READ VALUES DEPTH 2')
+            # within a list, we expect only value strings
+            if state.current_key == BD_IKEY_VALUES:
+                if state.list_depth == 1:
+                    # we are in a values list, but we read a weird string
+                    # NOTE we assume the entire message is corrupted and bail out,
+                    # parsing very conservatively is the key to sanity
+                    if slen != PEERINFO_LEN:
+                        IF BD_TRACE: g_trace.append(f'fail {state.fail}')
+                        state.fail = BAD_LENGTH_PEER
+                        return
+                    if out.n_peers < BD_MAX_PEERS:
+                        memcpy(
+                            out.peers + (PEERINFO_LEN * out.n_peers),
+                            data + start,
+                            PEERINFO_LEN,
+                        )
+                        out.n_peers += 1
+                        IF BD_TRACE: g_trace.append(f'!!! {out.n_peers}th peer')
 
             elif state.current_key == BD_IKEY_NODES:
                 # if the nodes array length is weird, or too long, fail
@@ -454,7 +496,7 @@ cdef inline void krpc_bdecode_s(
                     IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
                     return
                 else:
-                    IF BD_TRACE: g_trace.append(f'!!! TARGET[{slen}] = {data[start:ix[0]]}')
+                    IF BD_TRACE: g_trace.append(f'!!! TARGET[{slen}] = ...')
                     memcpy(out.target, data + start, slen)
 
             elif state.current_key == BD_IKEY_NID:
@@ -475,6 +517,18 @@ cdef inline void krpc_bdecode_s(
                     memcpy(out.ih, data + start, slen)
                     IF BD_TRACE: g_trace.append('!!! IH')
 
+            elif state.current_key == BD_IKEY_AP_NAME:
+                if slen > BD_MAXLEN_AP_NAME:
+                    IF BD_TRACE: g_trace('??? AP_NAME too long, ignoring.')
+                else:
+                    IF BD_TRACE: g_trace.append(
+                        f'!!! AP_NAME[{slen}] = {data[start:start + slen]}'
+                    )
+                    memcpy(out.ap_name, data + start, slen)
+                    out.ap_name_len = slen
+            else:
+                pass
+        # READ VALUES TOO DEEP
         else:
             state.fail = DICTS_TOO_DEEP
             IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
@@ -612,11 +666,10 @@ cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
         state.fail = BD_BUFFER_OVERFLOW
         return state.fail
 
-    IF BD_TRACE:
-        g_trace.clear()
+    IF BD_TRACE: g_trace.clear()
 
     out.n_nodes = out.n_peers = 0
-    out.tok_len = out.token_len = 0
+    out.tok_len = out.token_len = out.ap_name_len = 0
 
     memcpy_bytes(buf, data, ld)
 
@@ -625,13 +678,8 @@ cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
     state.list_depth = 0
     state.at_end = 0
 
-    # state.await_ki = BD_IKEY_NID | BD_IKEY_IH | BD_IKEY_NODES | BD_IKEY_VALUES | BD_IKEY_TOKEN
-    # state.await_ko = BD_OKEY_A | BD_OKEY_Q | BD_OKEY_R | BD_OKEY_T | BD_OKEY_Y
-    # state.await_q_type = Q_TYPE_AP | Q_TYPE_FN | Q_TYPE_GP | Q_TYPE_PG
-
     state.current_key = 0
     state.seen_keys = 0
-    # state.legal_kinds = Q_AP | Q_FN | Q_GP | Q_FN | R_AP | R_FN | R_GP | R_PG
     state.msg_kind = 0xffffffff
     state.save_ap_port = 0
     state.is_response = True
@@ -762,7 +810,7 @@ cdef bd_status krpc_bdecode(bytes data, parsed_msg *out):
 cdef void print_parsed_msg(parsed_msg *out):
 
     print(f'\tMETH = {krpc_method_names[out.method]}')
-    print(f'\tTOK[{out.token_len}] = "{out.tok[0:out.token_len]}"')
+    print(f'\tTOK[{out.tok_len}] = "{out.tok[0:out.tok_len]}"')
     print(f'\tNID[20] = "{out.nid[0:20]}"')
 
     if out.method == Q_AP:

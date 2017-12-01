@@ -1,6 +1,6 @@
 from libc.stdint cimport uint8_t as u8, uint64_t as u64, uint16_t as u16
 
-include "dht.pxi"
+include "dht_h.pxi"
 
 # XXX the redeclared shit appears to be a cython error and doesn't affect
 # functionality... let's hope it goes away
@@ -66,6 +66,8 @@ cdef:
         # ap stuff
         u16 ap_port
         bint ap_implied_port
+        u64 ap_name_len
+        u8 ap_name[BD_MAXLEN_AP_NAME]
 
     list g_trace
     dict bd_status_names
