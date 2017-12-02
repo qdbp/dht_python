@@ -11,7 +11,6 @@ from itertools import zip_longest, repeat
 import pickle
 import os
 import signal as sig
-# import sqlite3 as sql
 import MySQLdb as sql
 import sys
 import traceback as trc
@@ -33,9 +32,9 @@ from libc.string cimport memcmp, memset, memcpy
 from libc.math cimport sqrt, fmin, fmax
 
 # internal
-from dht.util cimport LRUCache
+from dht.util cimport LRUCache, sim_kad_apx, format_uptime
 from dht.bdecode_st cimport bd_status, parsed_msg, krpc_bdecode, print_parsed_msg
-from dht.bdecode_st cimport g_trace, bd_status_names, krpc_msg_type
+from dht.bdecode_st cimport bd_status_names, krpc_msg_type
 
 include "dht_h.pxi"
 
@@ -123,7 +122,14 @@ cdef class DHTListener:
     def __init__(self, scraper):
         self.scraper = scraper
 
-    cdef void send_msg(self, bytes msg, tuple addr, u64 prio, u8 ctl_byte):
+    cdef void send_msg(
+            self,
+            bytes msg,
+            tuple addr,
+            u64   prio,
+            u8    ctl_byte,
+            str   ctl_key):
+
         '''
         Ctl byte should be nid-constant but random over nids.
 
@@ -135,6 +141,7 @@ cdef class DHTListener:
             self.scraper.cnt['tx_msg_buffer_overflow'] += 1
         elif prio == 1 or ctl_byte <= 255 * self.scraper.ctl_reply_rate:
             self.scraper.cnt['tx_msg'] += 1
+            self.scraper.cnt[ctl_key] += 1
             self.transport.sendto(msg, addr)
         else:
             self.scraper.cnt['tx_msg_throttle_drop'] += 1
@@ -195,6 +202,7 @@ cdef class DHTScraper:
         object _ctl_cnt
         u64 _info_iter
         double _info_mark
+        double _control_mark
         double _rtt_buf[RTT_BUF_LEN]
         u64 _rtt_buf_ix
 
@@ -235,6 +243,7 @@ cdef class DHTScraper:
         self._ctl_cnt = self.cnt.copy()
         self._info_iter = 0
         self._info_mark = 0.
+        self._control_mark = 0.
 
         for i in range(RTT_BUF_LEN):
             self._rtt_buf[i] = 0.2
@@ -282,6 +291,7 @@ cdef class DHTScraper:
 
         return &self.rt_qual[ax][bx][cx]
 
+    @cython.profile(False)
     cdef u64 rt_add_sender_as_contact(
             self,
             parsed_msg *krpc,
@@ -290,15 +300,27 @@ cdef class DHTScraper:
 
         cdef u8 sender_pnode[NODEINFO_LEN]
         cdef bint good_addr
+        cdef u64 rep_status
 
         memcpy(sender_pnode, krpc.nid, NID_LEN)
-        good_addr = compact_peerinfo(sender_pnode + NID_LEN, addr[0], addr[1])
 
-        if good_addr:
-            return self.rt_random_replace_contact(sender_pnode, base_qual)
-        else:
+        good_addr = compact_peerinfo(sender_pnode + NID_LEN, addr[0], addr[1])
+        if not good_addr:
+            self.cnt['rt_replace_bad_node'] += 1
             return RT_REP_INVALID_NODE
 
+        rep_status = self.rt_random_replace_contact(sender_pnode, base_qual)
+
+        if rep_status == RT_REP_SUCCESS:
+            self.cnt['rt_replace_accept'] += 1
+        elif rep_status == RT_REP_NO_EVICT:
+            self.cnt['rt_replace_reject'] += 1
+        else:
+            self.cnt['rt_replace_bad_node'] += 1
+
+        return rep_status
+
+    @cython.profile(False)
     cdef u64 rt_random_replace_contact(self, u8 *new_pnode, u8 base_qual):
         '''
         Possibly randomly replaces the contact for `new_pnode` in the routing
@@ -313,10 +335,10 @@ cdef class DHTScraper:
         cdef u8* node_spot = self.rt_get_cell(new_pnode)
         cdef u8* qual_cell = self.rt_get_qual_cell(new_pnode)
 
-        if check_evict(qual_cell[0]):
+        if check_evict(qual_cell[0], base_qual):
             if validate_nodeinfo(new_pnode):
                 memcpy(node_spot, new_pnode, NODEINFO_LEN)
-                qual_cell[0] = MIN_QUAL
+                qual_cell[0] = base_qual if base_qual <= MAX_QUAL else MAX_QUAL
                 return RT_REP_SUCCESS
             return RT_REP_INVALID_NODE
         return RT_REP_NO_EVICT
@@ -328,7 +350,13 @@ cdef class DHTScraper:
         '''
 
         cdef u8 *qual_cell = self.rt_get_qual_cell(nid)
+        cdef u8 *cur_nodeinfo = self.rt_get_cell(nid)
         cdef i8 new_qual
+
+        # the contact we're trying to adjust has been replaced
+        # just do nothing in this case
+        if not is_row_equal(nid, cur_nodeinfo, NID_LEN):
+            return
 
         new_qual = qual_cell[0] + delta
         if new_qual < MIN_QUAL:
@@ -417,6 +445,12 @@ cdef class DHTScraper:
             self._db_row_pool.clear()
 
     cdef void handle_new_nodes(self, u8 *pnodes, u64 n_nodes):
+        '''
+        Generic processor for all new found nodes.
+
+        Sends out pings to qualifying nodes to referesh the routing table.
+        '''
+
         cdef u64 offset, status_code
         cdef bint did_replace
         cdef dht_node ping_contact
@@ -429,27 +463,75 @@ cdef class DHTScraper:
             # this call; this is sufficient since most calls share ax and bx
             zx = 1 << ((pnodes[offset + 2] & 0xe0) >> 5)
             if zx & bitmask:
-                self.cnt['rt_drop_repeat_replace'] += 1
+                self.cnt['rt_newnode_drop_repeat'] += 1
                 continue
 
-            # nodes from packed node lists get a low quality
-            status_code = self.rt_random_replace_contact(pnodes + offset, 1)
-            if status_code == RT_REP_INVALID_NODE:
-                self.cnt['rt_replace_bad_node'] += 1
-                return
+            elif random() > self.ctl_ping_rate:
+                self.cnt['rt_newnode_drop_unlucky'] += 1
+                continue
 
             bitmask |= zx
 
-            if status_code == RT_REP_NO_EVICT:
-                self.cnt['rt_replace_reject'] += 1
-            elif status_code == RT_REP_SUCCESS:
-                self.cnt['rt_replace_accept'] += 1
-            else:
-                self.cnt['err_rt_replace_bad_retval'] += 1
+            uncompact_nodeinfo(&ping_contact, pnodes + offset)
+            self.send_q_pg(&ping_contact)
 
-            if random() < self.ctl_ping_rate:
-                uncompact_nodeinfo(&ping_contact, pnodes + offset)
-                self.send_q_pg(&ping_contact)
+            self.cnt['rt_newnode_ping'] += 1
+
+    cdef void handle_gp_nodes(self, parsed_msg *krpc, tuple saddr):
+        '''
+        Processes nodes received in a get_peers reply.
+
+        Checks whether the we have an infohash tied to the reply, whether
+        the nodes received are suitable, and if yes, follows up with the
+        next node.
+        '''
+
+        cdef dht_node followup_contact
+        cdef u8 cur_sim, best_sim
+
+        old_nid = krpc.nid[0:IH_LEN]
+        maybe_ih = self.info_in_flight.get(old_nid)
+
+        if maybe_ih == 1:
+            # we matched peers for this, don't need nodes
+            return
+
+        if maybe_ih is None:
+            self.cnt['bm_gp_nodes_unmatched'] += 1
+            return
+
+        del self.info_in_flight[old_nid]
+
+        self._rtt_buf[self._rtt_buf_ix] = monotonic() - maybe_ih[1]
+        self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
+
+        target_ih = maybe_ih[0]
+
+        # NOTE: experiments have shown that selecting the best contact
+        # does not better than just picking the first
+        uncompact_nodeinfo(&followup_contact, krpc.nodes)
+        
+        if not followup_contact.valid:
+            self.cnt['bm_gp_node_invalid'] += 1
+            self.rt_adj_quality(old_nid, -2)
+            return
+
+        cur_sim = sim_kad_apx(followup_contact.nid, target_ih)
+        best_sim = sim_kad_apx(old_nid, target_ih)
+
+        if cur_sim <= best_sim:
+            self.cnt['bm_gp_node_too_far'] += 1
+            self.rt_adj_quality(old_nid, -2)
+            return
+
+        self.cnt['ih_got_good_next_hop'] += 1
+        self.rt_adj_quality(old_nid, 3)
+
+        self.send_q_gp(target_ih, &followup_contact, 1)
+        # XXX bytes conversion
+        self.info_in_flight[followup_contact.nid[0:NID_LEN]] =\
+            (target_ih, monotonic())
+
 
     cdef void handle_new_peers(self, u8 *nid, u8 *peers, u64 n_peers):
 
@@ -493,16 +575,18 @@ cdef class DHTScraper:
 
         self.db_update_peers(ih, good_peers)
 
+    # XXX get rid of tuple conversion
     cdef void handle_msg(self, bytes d, tuple saddr):
 
         cdef parsed_msg krpc
         cdef bd_status status
+        cdef u64 replace_status
         cdef u16 ap_port
-        cdef dht_node followup_contact
         cdef str decoded_name
         cdef bytes ih, raw_ap_name
 
         saddr = (saddr[0].encode('ascii'), saddr[1])
+
         status = krpc_bdecode(d, &krpc)
         self.cnt[f'st_{bd_status_names[status]}'] += 1
 
@@ -516,6 +600,8 @@ cdef class DHTScraper:
 
         if krpc.method == krpc_msg_type.Q_AP:
             self.cnt['rx_q_ap'] += 1
+
+            replace_status = self.rt_add_sender_as_contact(&krpc, saddr, 3)
 
             if krpc.token_len != 1 or krpc.token[0] != TOKEN:
                 self.cnt['bm_ap_bad_token'] += 1
@@ -547,11 +633,14 @@ cdef class DHTScraper:
 
         elif krpc.method == krpc_msg_type.Q_FN:
             self.cnt['rx_q_fn'] += 1
+            self.rt_add_sender_as_contact(&krpc, saddr, 2)
+
             pnode = self.rt_get_valid_neighbor_contact(krpc.target[0:IH_LEN])
             self.send_r_fn(pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
 
         elif krpc.method == krpc_msg_type.Q_GP:
             self.cnt['rx_q_gp'] += 1
+            self.rt_add_sender_as_contact(&krpc, saddr, 2)
             # FIXME this check is too slow, need to move to rolling bloom
             # filters
 
@@ -565,6 +654,8 @@ cdef class DHTScraper:
 
         elif krpc.method == krpc_msg_type.Q_PG:
             self.cnt['rx_q_pg'] += 1
+            self.rt_add_sender_as_contact(&krpc, saddr, 1)
+
             self.send_r_pg(krpc.nid, krpc.tok[0:krpc.tok_len], saddr, 0)
 
         elif krpc.method == krpc_msg_type.R_GP:
@@ -574,41 +665,11 @@ cdef class DHTScraper:
                 self.cnt['rx_r_gp_v'] += 1
                 self.handle_new_peers(krpc.nid, krpc.peers, krpc.n_peers)
 
+            # NOTE yes, ignore nodes from responses with peers
             elif krpc.n_nodes > 0:
                 self.cnt['rx_r_gp_n'] += 1
                 self.handle_new_nodes(krpc.nodes, krpc.n_nodes)
-
-                # XXX fixme. this is the most common path, and is also the
-                # slowest
-                old_nid = krpc.nid[0:IH_LEN]
-                maybe_ih = self.info_in_flight.get(old_nid)
-
-                if maybe_ih == 1:
-                    # we matched peers for this, don't need nodes
-                    return
-
-                if maybe_ih is None:
-                    self.cnt['bm_unmatched_nodes'] += 1
-                    return
-
-                self._rtt_buf[self._rtt_buf_ix] = monotonic() - maybe_ih[1]
-                self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
-
-                target_ih = maybe_ih[0]
-                # implicitly get just the first node
-                uncompact_nodeinfo(&followup_contact, krpc.nodes)
-                del self.info_in_flight[old_nid]
-
-                if followup_contact.valid:
-                    self.cnt['ih_matched_nodes'] += 1
-                    self.rt_adj_quality(old_nid, 1)
-                    self.send_q_gp(target_ih, &followup_contact, 1)
-                    # XXX bytes conversion
-                    self.info_in_flight[followup_contact.nid[0:NID_LEN]] =\
-                        (target_ih, monotonic())
-                else:
-                    self.cnt['bm_bad_next_hop'] += 1
-                    self.rt_adj_quality(old_nid, -2)
+                self.handle_gp_nodes(&krpc, saddr)
 
             elif krpc.n_peers + krpc.n_nodes == 0:
                 IF BD_TRACE:
@@ -632,6 +693,7 @@ cdef class DHTScraper:
             self.handle_new_nodes(krpc.nodes, 1)
 
         elif krpc.method == krpc_msg_type.R_PG:
+            self.rt_add_sender_as_contact(&krpc, saddr, 2)
             self.cnt['rx_r_pg'] += 1
 
         else:
@@ -666,8 +728,8 @@ cdef class DHTScraper:
         self.listener.send_msg(
             msg_buf[:Q_FN_LEN], node_to_addr_tup(dest),
             0, dest.nid[NID_LEN - 1],
+            'tx_q_fn',
         )
-        self.cnt['tx_q_fn'] += 1
 
     cdef void send_q_gp(self, u8 *ih, dht_node *dest, u64 prio):
         '''
@@ -683,8 +745,8 @@ cdef class DHTScraper:
         self.listener.send_msg(
             msg_buf[:Q_GP_LEN], node_to_addr_tup(dest),
             prio, dest.nid[NID_LEN - 1],
+            'tx_q_gp',
         )
-        self.cnt['tx_q_gp'] += 1
 
     cdef void send_q_pg(self, dht_node *dest):
         cdef u8 msg_buf[Q_PG_LEN]
@@ -695,12 +757,12 @@ cdef class DHTScraper:
         # XXX bytes conversion
         self.listener.send_msg(
             msg_buf[:Q_PG_LEN], node_to_addr_tup(dest),
-            0, dest.nid[NID_LEN - 1]
+            0,
+            dest.nid[NID_LEN - 1],
+            'tx_q_pg',
         )
-        self.cnt['tx_q_pg'] += 1
 
     cdef void send_r_fn(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
-        self.cnt['tx_r_fn'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) +
@@ -708,15 +770,15 @@ cdef class DHTScraper:
                 b'e1:t' + bencode_tok(tok) + b'1:y1:re'
             ),
             addr,
-            0, nid[NID_LEN - 1]
+            0,
+            nid[NID_LEN - 1],
+            'tx_r_fn',
         )
-        pass
 
     cdef void send_r_pg(self, u8 *nid, bytes tok, tuple daddr, u64 prio):
         '''
         Send a ping reply.
         '''
-        self.cnt['tx_r_pg'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) + b'e1:t' +
@@ -724,7 +786,8 @@ cdef class DHTScraper:
             ),
             daddr,
             prio,
-            nid[NID_LEN - 1]
+            nid[NID_LEN - 1],
+            'tx_r_pg',
         )
 
     cdef void send_r_gp(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
@@ -733,15 +796,16 @@ cdef class DHTScraper:
 
         Includes one packed node of length 26.
         '''
-
-        self.cnt['tx_r_gp'] += 1
         self.listener.send_msg(
             (
                 b'd1:rd2:id20:' + mk_sid(nid) +
                 b'5:token1:\x885:nodes26:' + bytes(pnode[0:NODEINFO_LEN]) +
                 b'e1:t' + bencode_tok(tok) + b'1:y1:re'
             ),
-            addr, 0, nid[NID_LEN - 1]
+            addr,
+            0,
+            nid[NID_LEN - 1],
+            'tx_r_gp',
         )
 
     @aio_loop_method(GP_SLEEP)
@@ -774,7 +838,7 @@ cdef class DHTScraper:
                 if bnid in self.info_in_flight:
                     self.cnt['ih_node_already_in_ifl'] += 1
                 else:
-                    self.send_q_gp(ih, &gp_contact, 0)
+                    self.send_q_gp(ih, &gp_contact, 1)
                     self.info_in_flight[bnid] = (ih, monotonic())
                     self.cnt['ih_naked_ih_put_in_ifl'] += 1
 
@@ -870,7 +934,9 @@ cdef class DHTScraper:
         using a temporary table.
         '''
 
-        cdef list staged_ihs = sorted(self._db_new_ih_staging)
+        cdef list staged_ihs = sorted(
+            self._db_new_ih_staging - self.info_in_flight.keys()
+        )
         self._db_new_ih_staging.clear()
 
         self.cnt['ih_staged_all'] += len(staged_ihs)
@@ -904,7 +970,7 @@ cdef class DHTScraper:
             WHERE
                 (`peerinfo`.`timestamp` IS NULL)
                 OR
-                ADDDATE(`peerinfo`.`timestamp`, INTERVAL 86400 SECOND) < NOW()
+                ADDDATE(`peerinfo`.`timestamp`, INTERVAL 259200 SECOND) < NOW()
             '''
         )
 
@@ -943,15 +1009,19 @@ cdef class DHTScraper:
         of the scraper to optimize performance.
         '''
 
+        cdef double t = monotonic()
+        cdef double dt = t - self._control_mark
+        self._control_mark = t
+
         dcnt = self.cnt - self._ctl_cnt
         self._ctl_cnt = self.cnt.copy()
 
-        gprr = dcnt['rx_r_gp'] / (dcnt['tx_q_gp'] + 1)
+        cdef double gpps = dcnt['rx_q_gp'] / dt
 
-        # self.ctl_reply_rate = min(1 + gprr - GPRR_TARGET, 1.0)
-
-        if dcnt['tx_msg_drop'] > 10:
-            self.ctl_ifl_target = max(self.ctl_ifl_target - 2, MIN_IFL_TARGET)
+        self.ctl_reply_rate = max(0.0, min(
+                1.0,
+                1 - (gpps - GPPS_RX_TARGET) / (GPPS_RX_MAX - GPPS_RX_TARGET)
+            ))
 
         self.ctl_ihash_discard = len(self.naked_ihashes) / MAX_IHASHES
         self.ctl_ping_rate = (1 - self.ctl_ihash_discard) / 10
@@ -992,6 +1062,31 @@ cdef class DHTScraper:
         x = Counter()
         x.update({k: int(v / dt) for k, v in raw_dcnt.items()})
 
+        self.cnt['perf_rtrr'] = rt_rr
+        self.cnt['perf_rr_gp'] = gprr
+        self.cnt['perf_rr_fn'] =\
+            min(1.0, (raw_dcnt['rx_r_fn'] + 1) / (raw_dcnt['tx_q_fn'] + 1))
+        self.cnt['perf_rr_pg'] =\
+            min(1.0, (raw_dcnt['rx_r_pg'] + 1) / (raw_dcnt['tx_q_pg'] + 1))
+
+        self.cnt['perf_rr_tot'] = min(
+            1.0,
+            (
+                raw_dcnt['rx_r_fn'] +
+                raw_dcnt['rx_r_pg'] +
+                raw_dcnt['rx_r_gp'] + 1
+            ) / (
+                raw_dcnt['tx_q_fn'] +
+                raw_dcnt['tx_q_pg'] +
+                raw_dcnt['tx_q_gp'] + 1
+            )
+        )
+
+        self.cnt['perf_rtt_ms'] = 1000. * rtt.mean
+        self.cnt['perf_rtt_ms_std'] = 1000. * rtt.std
+
+        self.cnt['perf_db_newr'] = newr
+
         info = (
             f'{format_uptime(int(monotonic() - self._start_time)):>9s} | '  # len 11
             f'{x["rx_q_pg"]:>5d} '  # len 6
@@ -1003,7 +1098,7 @@ cdef class DHTScraper:
             f'{x["tx_r_gp"]:>5d} {x["tx_q_pg"]:>5d} '  # len 12
             f'{x["tx_r_pg"]:>5d} | '  # len 6
             f'{x["db_update_peers"]:>4d} {x["db_rows_inserted"]:>5d} ' #  len 10
-            f'{x["ih_staged_all"]:>5d} {newr:4.2f} | '  # len 13
+            f'{x["ih_staged_all"]:>5d} {newr:5.3f} | '  # len 14
             f'{gprr:>4.2f}({self.ctl_reply_rate:>4.2f}) ' # len 11
             f'{self.ctl_ifl_target:>4d} {vnr:4.2f} '  # len 15
             f'{int(1000 * rtt.mean):>3d}±{int(1000 * rtt.std):>3d} | '  # len 10
@@ -1029,7 +1124,7 @@ cdef class DHTScraper:
             '   fn  r_fn    gp '
             ' gp_r    pg  pg_r | '
             'dbup  dbnr '
-            '  stg newr | '
+            '  stg  newr | '
             'gprr (own) '
             'load  vnr '
             'rtt(ms) | '
@@ -1051,7 +1146,7 @@ cdef class DHTScraper:
         # this can be later than the first time call in info(), causing
         # stupidity
         self._start_time = monotonic()
-        self._info_mark = monotonic()
+        self._info_mark = self._control_mark = monotonic()
 
         self.load_data()
 
@@ -1074,6 +1169,8 @@ cdef class DHTScraper:
                 self.loop_save_data(),
             ]
         ]
+
+        # self.listener.transport.sock.setsockopt
         def stop_all():
             for task in tasks:
                 task.cancel()
@@ -1082,12 +1179,17 @@ cdef class DHTScraper:
 
         self.loop.run_forever()
 
-    def format_detailed_info(self):
+    cdef str format_detailed_info(self):
         '''
         Prints tables of detailed information on request.
         '''
 
-        cdef int table_width = 35 + 12 + 3
+        cdef int pad_width = 1
+        cdef int key_width = 35
+        cdef int num_width = 15
+
+        cdef int field_width = key_width + num_width
+        cdef int padded_field_width = 2 * pad_width + field_width
 
         unique_prefixes = {s.split('_')[0] for s in self.cnt if '_' in s}
         tables = {prefix: [] for prefix in unique_prefixes}
@@ -1096,12 +1198,21 @@ cdef class DHTScraper:
             if not '_' in k:
                 continue
             prefix = k.split('_')[0]
-            tables[prefix].append(f' {k:.<35s}{v:.>12d} ')
+            tables[prefix].append(
+                f'{"":{pad_width}s}' +
+                f'{k:.<{key_width}s}' + 
+                (
+                    f'{v:.>{num_width},d}'
+                    if prefix != 'perf'
+                    else f'{v:.>{num_width}.2f}'
+                ) +
+                f'{"":{pad_width}s}',
+            )
 
         for t in tables.values():
             t.sort()
 
-        while 1 + len(tables) * table_width > TERMINAL_WIDTH and\
+        while 1 + len(tables) * (1 + padded_field_width) > TERMINAL_WIDTH and\
                 len(tables) > 1:
 
             by_size = sorted(tables.items(), key=lambda x: len(x[1]))
@@ -1112,7 +1223,7 @@ cdef class DHTScraper:
 
             # append a divider and the contents of the smallest table
             # to the second smallest
-            sst.append(' ' + '-' * (35 + 12) + ' ')
+            sst.append(' ' + '-' * (field_width) + ' ')
             sst.extend(smt)
 
             # and delete the smallest
@@ -1128,7 +1239,7 @@ cdef class DHTScraper:
                 pad_table,
                 *[tables[k] for k in sorted(tables.keys())],
                 end_table,
-                fillvalue=' ' * (35 + 12 + 2),
+                fillvalue=' ' * padded_field_width,
             )
         ])
 
@@ -1338,37 +1449,6 @@ cdef inline u16 unpack_port(u8 *packed_port):
     '''MEM-UNSAFE'''
     return packed_port[0] * 256 + packed_port[1]
 
-cdef str format_uptime(u64 s):
-    '''
-    Formats an elapsed time in seconds as a nice string of equal width
-    for all times.
-    '''
-    cdef:
-        int m, h, d, y
-
-    if 3600 <= s < (24 * 3600):
-        h = s // 3600
-        m = (s // 60) % 60
-        return '{:>2d} h {:>2d} m'.format(h, m)
-
-    elif 60 <= s < 3600:
-        m = s // 60
-        s = s % 60
-        return '{:>2d} m {:>2d} s'.format(m, s)
-
-    if (24 * 3600) <= s < (24 * 3600 * 365):
-        d = s // (24 * 3600)
-        h = (s // 3600) % 24
-        return '{:>2d} d {:>2d} h'.format(d, h)
-
-    elif 0 <= s < 60:
-        return '     {:>2d} s'.format(s)
-
-    else:
-        y = s // (365 * 24 * 3600)
-        d = (s // (3600 * 24)) % 365
-        return '{:>2d} y {:>2d} d'.format(y, d)
-
 @cython.profile(False)
 cdef inline bint is_row_empty(u8 *row):
     '''
@@ -1379,17 +1459,25 @@ cdef inline bint is_row_empty(u8 *row):
 @cython.profile(False)
 cdef inline bint is_row_equal(u8 *row, u8 *target, u64 up_to):
     '''
-    MEM-UNSAFE
+    MEM-UNSAFE [row[0:up_to], target[0:up_to]]
     '''
     return 0 == memcmp(row, target, up_to)
 
 # FIXME prio 7 randint is slow, use rand
-cdef bint check_evict(u64 qual):
+@cython.profile(False)
+cdef bint check_evict(u64 cur_qual, u64 cand_qual):
     '''
-    Evicts qual x with prob 1 / (2 ^ x).
+    Checks if a node with quality `cur_qual` should be replaced with
+    one of quality `cand_qual`.
+
+    If `cand_qual` > `cur_qual`, evicts certainly. Else, evicts with
+    probability 1 / 2 ** (cur_qual - cand_qual)
     '''
 
-    return randint(1 << qual) == 0
+    if cand_qual >= cur_qual:
+        return 1
+
+    return randint(1 << (cur_qual - cand_qual)) == 0
 
 # FIXME prio 4 should not need this, should extract raw token from request and
 # pass it down

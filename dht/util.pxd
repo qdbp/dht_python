@@ -1,4 +1,4 @@
-from libc.stdint cimport uint64_t
+from libc.stdint cimport uint64_t as u64, uint8_t as u8
 
 cdef class LRULink:
     cdef public:
@@ -9,11 +9,11 @@ cdef class LRULink:
 
 cdef class LRUCache:
     cdef:
-        uint64_t hits
-        uint64_t misses
-        uint64_t maxlen
+        u64 hits
+        u64 misses
+        u64 maxlen
 
-        uint64_t _len
+        u64 _len
         dict _d
 
         LRULink head
@@ -24,3 +24,7 @@ cdef class LRUCache:
     cdef object get(self, object)
     cdef tuple stats(self)
     cdef void reset_stats(self)
+
+cdef u64 sim_kad_apx(u8 *, u8 *)
+
+cdef str format_uptime(u64)

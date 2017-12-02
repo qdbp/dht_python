@@ -1,6 +1,9 @@
 # cython: profile=True
-from libc.stdint cimport uint64_t
+from libc.stdint cimport uint64_t as u64, uint8_t as u8
 cimport cython
+
+include "dht_h.pxi"
+
 
 @cython.freelist(16)
 cdef class LRULink:
@@ -11,7 +14,7 @@ cdef class LRUCache:
     A generic dict-cache with recency-based eviction.
     '''
 
-    def __cinit__(self, uint64_t maxlen):
+    def __cinit__(self, u64 maxlen):
         # need maxlen to be at least two for the code below to run correctly
         self.maxlen = max(maxlen, 2)
         self.hits = 0
@@ -119,3 +122,64 @@ cdef class LRUCache:
     cdef void reset_stats(self):
         self.hits = 0
         self.misses = 0
+
+
+cdef u64 tab_kad[256]
+
+tab_kad = [8] + [7] + [6] * 2 + [5] * 4 + [4] * 8 + [3] * 16 + [2] * 32 + [1] * 64 + [0] * 128
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef u64 sim_kad_apx(u8 *x, u8 *y):
+    '''
+    MEM-UNSAFE [x[0:IH_LEN], y[0:IH_LEN]]
+
+    Approximate kademlia similarity, given by index of first bit at which the
+    inputs differ, or 160 if they do not differ.
+
+    Range [0, 160]
+    '''
+    
+    cdef u64 out = 0
+    cdef u8 byte_sim = 0
+    cdef u64 ix = 0
+
+    for ix in range(IH_LEN):
+        byte_sim = tab_kad[x[ix] ^ y[ix]]
+        out += byte_sim
+        if byte_sim < 8:
+            break
+
+    return out
+
+cdef str format_uptime(u64 s):
+    '''
+    Formats an elapsed time in seconds as a nice string of equal width
+    for all times.
+    '''
+    cdef:
+        int m, h, d, y
+
+    if 3600 <= s < (24 * 3600):
+        h = s // 3600
+        m = (s // 60) % 60
+        return '{:>2d} h {:>2d} m'.format(h, m)
+
+    elif 60 <= s < 3600:
+        m = s // 60
+        s = s % 60
+        return '{:>2d} m {:>2d} s'.format(m, s)
+
+    if (24 * 3600) <= s < (24 * 3600 * 365):
+        d = s // (24 * 3600)
+        h = (s // 3600) % 24
+        return '{:>2d} d {:>2d} h'.format(d, h)
+
+    elif 0 <= s < 60:
+        return '     {:>2d} s'.format(s)
+
+    else:
+        y = s // (365 * 24 * 3600)
+        d = (s // (3600 * 24)) % 365
+        return '{:>2d} y {:>2d} d'.format(y, d)
+
