@@ -77,8 +77,12 @@ cdef:
         u16 port
 
     u8 ZERO_ROW[NODEINFO_LEN]
+    u8 SID_XOR[20]
 
+SID_XOR = list(b'\x00\x00X\xf3Q\xca\xf1=\xd42\xae\x86j\xa9\xd6\x0c=\xe8D\x99')
 memset(ZERO_ROW, 0, NODEINFO_LEN)
+
+# === stats codes ===
 
 # FIXME: take out to vnv
 def aio_loop_method(double sleep_time, double init_sleep=1e-3):
@@ -214,7 +218,7 @@ cdef class DHTScraper:
     def __cinit__(self):
         # == DHT ==
         # plain list of known infohashes
-        self.naked_ihashes = deque([], maxlen=MAX_IHASHES)  # type: ignore
+        self.naked_ihashes = deque([], maxlen=IH_POOL_LEN)  # type: ignore
 
         # info hashes actively being identified
         # indexed by associated nids; this is onto
@@ -913,11 +917,6 @@ cdef class DHTScraper:
         self._db_desc_pool.clear()
 
         self._db.executemany(
-            # '''
-            # INSERT INTO `metainfo` (`info_hash`, `description`)
-            # VALUE (%(ih)s, %(desc)s)
-            # ON DUPLICATE KEY UPDATE SET `description`=%(desc)s
-            # ''',
             '''
             UPDATE `metainfo`
             SET `description`=%(desc)s
@@ -1023,7 +1022,7 @@ cdef class DHTScraper:
                 1 - (gpps - GPPS_RX_TARGET) / (GPPS_RX_MAX - GPPS_RX_TARGET)
             ))
 
-        self.ctl_ihash_discard = len(self.naked_ihashes) / MAX_IHASHES
+        self.ctl_ihash_discard = len(self.naked_ihashes) / IH_POOL_LEN
         self.ctl_ping_rate = (1 - self.ctl_ihash_discard) / 10
 
         rtt_stat = self.metric_gp_rtt()
@@ -1359,7 +1358,7 @@ cdef bytes compact_peerinfo_bytes(bytes ip_addr, u16 port):
         return None
 
 @cython.profile(False)
-cdef inline bint compact_peerinfo(u8 *dest_buf, bytes ip_addr, u16 port):
+cdef inline bint compact_peerinfo(u8 *dest_buf, u8 *ip_addr, u16 port):
     '''
     MEM-UNSAFE [dest_buf]
 

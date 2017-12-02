@@ -9,8 +9,12 @@ include "dht_h.pxi"
 cdef class LRULink:
     pass
 
+cdef object LRU_EMTPY = object()
+
 cdef class LRUCache:
     '''
+    THREAD-UNSAFE
+
     A generic dict-cache with recency-based eviction.
     '''
 
@@ -19,24 +23,24 @@ cdef class LRUCache:
         self.maxlen = max(maxlen, 2)
         self.hits = 0
         self.misses = 0
-        self._len = 0
-        self._d = {}
+        self.len = 0
+        self.d = {}
 
     cdef void traverse(self):
-        print('len is', self._len)
-        print('dict is', self._d)
+        print('len is', self.len)
+        print('dict is', self.d)
         cdef LRULink cur_node = self.head
         while cur_node:
             print(cur_node.key, cur_node.val)
             cur_node = cur_node.nx
 
     cdef void insert(self, object key, object val):
-        cdef:
-            LRULink this_link
+
+        cdef LRULink this_link
 
         # if we have the link in the dict, we move it to the front...
-        if key in self._d:
-            this_link = self._d[key]
+        if key in self.d:
+            this_link = self.d[key]
             # update its value, knowing the key stays the same...
             this_link.val = val
 
@@ -46,7 +50,7 @@ cdef class LRUCache:
                 this_link.nx.pr = this_link.pr
 
             # if it's a proper tail
-            elif this_link.pr and not this_link.nx:
+            elif this_link.pr is not None and this_link.nx is None:
                 this_link.pr.nx = None
                 self.tail = this_link.pr
 
@@ -64,19 +68,19 @@ cdef class LRUCache:
         # if we don't have the key...
         else:
             # if there's room, we mint a new link
-            if self._len < self.maxlen:
+            if self.len < self.maxlen:
                 this_link = LRULink()
                 this_link.key = key
                 this_link.val = val
 
-                self._len += 1
-                self._d[key] = this_link
+                self.len += 1
+                self.d[key] = this_link
 
                 # if it's the first link, create the head
                 if self.head is None:
                     self.head = this_link
                     self.tail = this_link
-                    self._d[key] = self.head
+                    self.d[key] = self.head
                     return
                 # otherwise attach the new link as the new head
                 else:
@@ -87,12 +91,12 @@ cdef class LRUCache:
             else:
                 this_link = self.tail
                 # deleting the reference to the old key from the dict...
-                del self._d[this_link.key]
+                del self.d[this_link.key]
                 # updating the key and value...
                 this_link.key = key
                 this_link.val = val
                 # insert it into the dict
-                self._d[key] = this_link
+                self.d[key] = this_link
                 # making the previous link the tail...
                 self.tail = self.tail.pr
                 self.tail.nx = None
@@ -103,14 +107,72 @@ cdef class LRUCache:
                 self.head = this_link
 
     cdef object get(self, object key):
-        if key in self._d:
-            val = self._d[key].val
+        if key in self.d:
+            val = self.d[key].val
             self.insert(key, val)
             self.hits += 1
             return val
         else:
             self.misses += 1
             return None
+
+    cdef object pophead(self):
+        '''
+        Returns the value of the head of the LRU (the most recently seen
+        object), and removes that object from the cache.
+
+        If the LRU is empty, returns the special sentinel value LRU_EMTPY
+        '''
+
+        cdef object key, val
+
+        if self.len > 0:
+            key = self.head.key
+            val = self.head.val
+
+            # we have a proper head
+            if self.head.nx is not None:
+                self.head.nx.pr = None
+                self.head = self.head.nx
+            # we popped the last object
+            else:
+                self.head = self.tail = None
+
+            del self.d[key]
+            self.len -= 1
+
+            return (key, val)
+        else:
+            return LRU_EMTPY
+
+    cdef object poptail(self):
+        '''
+        Returns the value of the tail of the LRU (the least recently seen
+        living object), and removes that object from the cache.
+
+        If the LRU is empty, returns the special sentinel value LRU_EMTPY
+        '''
+
+        cdef object key, val
+
+        if self.len > 0:
+            key = self.tail.key
+            val = self.tail.val
+
+            # we have a proper tail
+            if self.tail.pr is not None:
+                self.tail.pr.nx = None
+                self.tail = self.tail.pr
+            # else we popped the last object
+            else:
+                self.head = self.tail = None
+
+            del self.d[key]
+            self.len -= 1
+
+            return (key, val)
+        else:
+            return LRU_EMTPY
 
     cdef tuple stats(self):
         return (
@@ -122,6 +184,9 @@ cdef class LRUCache:
     cdef void reset_stats(self):
         self.hits = 0
         self.misses = 0
+
+    def __len__(self):
+        return self.len
 
 
 cdef u64 tab_kad[256]

@@ -27,7 +27,6 @@ DEF MSG_BUF_LEN = 512
 
 # MESSAGE LENGTHS
 # for computing sids from nids
-DEF SID_XOR = b'\x00\x00X\xf3Q\xca\xf1=\xd42\xae\x86j\xa9\xd6\x0c=\xe8D\x99'
 # d1:ad2:id20: + $nid + 6:target20: + $target + e1:q9:find_node1:t1:\x771:y1:qe
 DEF Q_FN_PROTO =\
     b'd1:ad2:id20:' + b'\x11' * 20 +\
@@ -69,10 +68,9 @@ DEF IH_DESC_SLEEP = 5.0
 
 # cache sizes and flush intervals
 DEF MAX_NODES = 25000
-DEF MAX_IHASHES = 25000
+DEF IH_POOL_LEN = 1 << 16
 DEF RTT_BUF_LEN = 1000
 DEF ROW_POOL_MAXLEN = 1000
-DEF DB_LRU_MAXSIZE = 25000000
 
 DEF GP_QS_PER_IH = 2
 DEF FP_THRESH = MAX_NODES // 2
