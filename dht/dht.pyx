@@ -2,6 +2,8 @@
 '''
 Stateless DHT scraper.
 '''
+include "dht_h.pxi"
+
 from atexit import register as atxreg
 import asyncio as aio
 from asyncio import sleep as asleep
@@ -14,7 +16,8 @@ import signal as sig
 import MySQLdb as sql
 import sys
 import traceback as trc
-from socket import inet_ntoa, inet_aton
+from socket import inet_ntoa, inet_aton, socket
+from socket import AF_INET, SOCK_DGRAM, SO_BINDTODEVICE
 from time import time, monotonic
 
 import numpy as np
@@ -24,21 +27,19 @@ from uvloop import new_event_loop as new_uv_loop
 from vnv.util import save_pickle, load_pickle
 from vnv.log import get_logger
 
-cimport cython
-from libc.stdint cimport uint8_t as u8, uint16_t as u16, uint64_t as u64
-from libc.stdint cimport int8_t as i8, int64_t as i64
 from libc.stdio cimport FILE, fopen, fwrite, fclose, fread, sprintf
 from libc.string cimport memcmp, memset, memcpy
 from libc.math cimport sqrt, fmin, fmax
 
 # internal
-from dht.util cimport LRUCache, sim_kad_apx, format_uptime
-from dht.bdecode_st cimport bd_status, parsed_msg, krpc_bdecode, print_parsed_msg
-from dht.bdecode_st cimport bd_status_names, krpc_msg_type
-
-include "dht_h.pxi"
+from dht.util cimport LRUCache, LRU_EMTPY, LRU_NONE, sim_kad_apx, format_uptime
+from dht.bdecode_st cimport parsed_msg, print_parsed_msg, krpc_bdecode
+from dht.bdecode_st cimport bd_status_names
+from dht.rt cimport rt_node_t, rt_info_t
+# from dht.rt cimport upsert_pnode, rt_adj_quality
 
 class BadState(Exception): pass
+
 
 # from dht.bencode cimport bdecode_d
 
@@ -47,8 +48,9 @@ sys.tracebacklimit = 1000
 
 # net: sockets
 DHT_LPORT = int(sys.argv[1])
-if len(sys.argv) > 2:
-    LOG.setLevel(int(sys.argv[2]))
+DHT_LHOST = sys.argv[2]
+if len(sys.argv) > 3:
+    LOG.setLevel(int(sys.argv[3]))
 
 cdef BOOTSTRAP = [('67.215.246.10', 6881)]
 
@@ -65,21 +67,25 @@ cdef:
         double mean
         double std
 
-    struct dht_node:
-        # set by unpacking functions; should discard this node at a good time
-        bint valid
-        # computed sid
-        u8 sid[IH_LEN]
-        # krpc node info
-        u8 nid[IH_LEN]
-        # FIXME @raw_uv: should not need extensive-form ip
-        u8 ip[IP_LEN]
+    cdef struct dht_node_t:
+        u8 nid[NIH_LEN]
+        u8 pip[IP_LEN]
         u16 port
 
     u8 ZERO_ROW[NODEINFO_LEN]
     u8 SID_XOR[20]
 
-SID_XOR = list(b'\x00\x00X\xf3Q\xca\xf1=\xd42\xae\x86j\xa9\xd6\x0c=\xe8D\x99')
+    u8 BOOTSTRAP_PNODE[NODEINFO_LEN]
+
+
+BOOTSTRAP_PNODE = list(
+        b'2\xf5NisQ\xffJ\xec)\xcd\xba\xab\xf2\xfb\xe3F|\xc2g'
+        b'\x00\x00\x00\x00\x00\x00'
+    )
+compact_peerinfo(BOOTSTRAP_PNODE + NIH_LEN, b'67.215.246.10', 6881)
+
+SID_XOR = list(b'\x00\x00\x00submittothescrape')
+
 memset(ZERO_ROW, 0, NODEINFO_LEN)
 
 # === stats codes ===
@@ -132,7 +138,7 @@ cdef class DHTListener:
             tuple addr,
             u64   prio,
             u8    ctl_byte,
-            str   ctl_key):
+            ST    stat_code):
 
         '''
         Ctl byte should be nid-constant but random over nids.
@@ -142,29 +148,29 @@ cdef class DHTListener:
         '''
 
         if prio == 0 and self._do_drop:
-            self.scraper.cnt['tx_msg_buffer_overflow'] += 1
+            self.scraper.cnt[<int>ST.tx_msg_drop_overflow] += 1
         elif prio == 1 or ctl_byte <= 255 * self.scraper.ctl_reply_rate:
-            self.scraper.cnt['tx_msg'] += 1
-            self.scraper.cnt[ctl_key] += 1
+            self.scraper.cnt[<int>ST.tx_tot] += 1
+            self.scraper.cnt[<int>stat_code] += 1
             self.transport.sendto(msg, addr)
         else:
-            self.scraper.cnt['tx_msg_throttle_drop'] += 1
+            self.scraper.cnt[<int>ST.tx_msg_drop_throt] += 1
 
     cpdef void connection_made(self, object transport):
         LOG.info('Connection made.')
         self.transport = transport
 
     cpdef void error_received(self, object exc):
-        self.scraper.cnt['rx_err_' + exc.__class__.__name__] += 1
+        self.scraper.cnt[<int>ST.rx_err_received] += 1
 
     cpdef void datagram_received(self, bytes data, tuple saddr):
         try:
             self.scraper.handle_msg(data, saddr)
-            self.scraper.cnt['rx_msg'] += 1
+            self.scraper.cnt[<int>ST.rx_tot] += 1
         except OSError as e:
-            self.scraper.cnt['rx_err_OSError'] += 1
+            self.scraper.cnt[<int>ST.rx_oserr] += 1
         except Exception as e:
-            self.scraper.cnt['err_rx_' + e.__class__.__name__] += 1
+            self.scraper.cnt[<int>ST.err_rx_exc] += 1
             LOG.error(f'Unhandled error in handle_raw_msg\n{trc.format_exc()}')
 
     cpdef void pause_writing(self):
@@ -177,11 +183,14 @@ cdef class DHTScraper:
 
     cdef:
         # data objects
-        object naked_ihashes
-        dict info_in_flight
-        unsigned char rt[256][256][RT_CONTACTS_PER_BIN][NODEINFO_LEN]
-        unsigned char rt_qual[256][256][RT_CONTACTS_PER_BIN]
-        object cnt
+        # object naked_ihashes
+        LRUCache naked_ihashes
+        u8 rt[256][256][256][NODEINFO_LEN]
+        u8 rt_qual[256][256][256]
+
+        # in-flight dicts
+        dict _ifl_dict
+        set _ifl_ih_hold
 
         # runtime objects
         DHTListener listener
@@ -200,32 +209,47 @@ cdef class DHTScraper:
         # curtail own r_gp if we're flooded
         double ctl_reply_rate
 
+        # counters
+        u64 cnt      [<int>ST._ST_ENUM_END]
+        u64 _disp_cnt[<int>ST._ST_ENUM_END]
+        u64 _ctl_cnt [<int>ST._ST_ENUM_END]
+
         # internal control variables
         float _start_time
-        object _disp_cnt
-        object _ctl_cnt
         u64 _info_iter
         double _info_mark
         double _control_mark
+
         double _rtt_buf[RTT_BUF_LEN]
         u64 _rtt_buf_ix
+
+        u64 _dkad_buf[DKAD_BUF_LEN]
+        u64 _dkad_buf_ix
 
         # caches and pools for I/O ops
         list _db_row_pool
         dict _db_desc_pool
         set _db_new_ih_staging
+        dict _ih_gp_holdoff
+        dict _ih_db_holdoff
+        LRUCache _ih_recent_peer_cache
+
+        # NEW RT
+        rt_node_t rt_root
+
 
     def __cinit__(self):
         # == DHT ==
         # plain list of known infohashes
-        self.naked_ihashes = deque([], maxlen=IH_POOL_LEN)  # type: ignore
+        # self.naked_ihashes = deque([], maxlen=IH_POOL_LEN)  # type: ignore
+        self.naked_ihashes = LRUCache(IH_POOL_LEN)  # type: ignore
 
-        # info hashes actively being identified
-        # indexed by associated nids; this is onto
-        self.info_in_flight = {}
+        self._ifl_dict = {}
+        self._ifl_ih_hold = set()
 
         # counter for various statistics of interest, reset every report cycle
-        self.cnt = Counter()
+        for ix in range(<int>ST._ST_ENUM_END):
+            self.cnt[ix] = self._disp_cnt[ix] = self._ctl_cnt[ix] = 0
 
         self.listener = DHTListener(self)
 
@@ -243,18 +267,24 @@ cdef class DHTScraper:
         atxreg(self._db_conn.commit)
 
         # internal flag variables
-        self._disp_cnt = self.cnt.copy()
-        self._ctl_cnt = self.cnt.copy()
         self._info_iter = 0
         self._info_mark = 0.
         self._control_mark = 0.
 
+        self._rtt_buf_ix = 0
         for i in range(RTT_BUF_LEN):
             self._rtt_buf[i] = 0.2
+
+        self._dkad_buf_ix = 0
+        for i in range(DKAD_BUF_LEN):
+            self._dkad_buf[i] = 0
 
         self._db_row_pool = []
         self._db_desc_pool = {}
         self._db_new_ih_staging = set()
+        self._ih_gp_holdoff = {}
+        self._ih_db_holdoff = {}
+        self._ih_recent_peer_cache = LRUCache(RECENT_PEER_CACHESIZE)
 
         # control variables
         self.ctl_ifl_target = BASE_IFL_TARGET
@@ -263,6 +293,9 @@ cdef class DHTScraper:
         self.ctl_timeout = BASE_GP_TIMEOUT
         self.ctl_ping_rate = BASE_PING_RATE
         self.ctl_reply_rate = 1.0
+
+        # NEW RT
+        # upsert_pnode(&self.rt_root, BOOTSTRAP_PNODE, 0x07)
 
     @cython.profile(False)
     cdef inline u8* rt_get_cell(self, u8 *nid):
@@ -275,7 +308,8 @@ cdef class DHTScraper:
         cdef:
             u8 ax = nid[0]
             u8 bx = nid[1]
-            u8 cx = (nid[2] & 0xe0) >> 5
+            u8 cx = nid[2]
+            # u8 cx = (nid[2] & 0xe0) >> 5
 
         return self.rt[ax][bx][cx]
 
@@ -291,7 +325,8 @@ cdef class DHTScraper:
         cdef:
             u8 ax = nid[0]
             u8 bx = nid[1]
-            u8 cx = (nid[2] & 0xe0) >> 5
+            u8 cx = nid[2]
+            # u8 cx = (nid[2] & 0xe0) >> 5
 
         return &self.rt_qual[ax][bx][cx]
 
@@ -306,21 +341,21 @@ cdef class DHTScraper:
         cdef bint good_addr
         cdef u64 rep_status
 
-        memcpy(sender_pnode, krpc.nid, NID_LEN)
+        memcpy(sender_pnode, krpc.nid, NIH_LEN)
 
-        good_addr = compact_peerinfo(sender_pnode + NID_LEN, addr[0], addr[1])
+        good_addr = compact_peerinfo(sender_pnode + NIH_LEN, addr[0], addr[1])
         if not good_addr:
-            self.cnt['rt_replace_bad_node'] += 1
+            self.cnt[<int>ST.rt_replace_invalid] += 1
             return RT_REP_INVALID_NODE
 
         rep_status = self.rt_random_replace_contact(sender_pnode, base_qual)
 
         if rep_status == RT_REP_SUCCESS:
-            self.cnt['rt_replace_accept'] += 1
+            self.cnt[<int>ST.rt_replace_accept] += 1
         elif rep_status == RT_REP_NO_EVICT:
-            self.cnt['rt_replace_reject'] += 1
+            self.cnt[<int>ST.rt_replace_reject] += 1
         else:
-            self.cnt['rt_replace_bad_node'] += 1
+            self.cnt[<int>ST.rt_replace_invalid] += 1
 
         return rep_status
 
@@ -359,7 +394,7 @@ cdef class DHTScraper:
 
         # the contact we're trying to adjust has been replaced
         # just do nothing in this case
-        if not is_row_equal(nid, cur_nodeinfo, NID_LEN):
+        if not is_row_equal(nid, cur_nodeinfo, NIH_LEN):
             return
 
         new_qual = qual_cell[0] + delta
@@ -376,10 +411,14 @@ cdef class DHTScraper:
         '''
 
         cdef u8 *neighbor_cell = self.rt_get_cell(target)
+        cdef u64 ix
 
         if not is_row_empty(neighbor_cell):
             return neighbor_cell
 
+        # XXX: maybe check near neighbors; hard to guarantee "near" in rt
+        # ordering under kad distance
+        self.cnt[<int>ST.rt_miss] += 1
         return NULL
 
     cdef u8* rt_get_random_valid_node(self):
@@ -396,17 +435,16 @@ cdef class DHTScraper:
 
         for ix in range(0, RT_TOTAL_CONTACTS):
             jx = (start_ix + ix) % RT_TOTAL_CONTACTS
-            ax = jx // (RT_CONTACTS_PER_BIN * 256)
-            bx = (jx // RT_CONTACTS_PER_BIN) % 256
-            cx = jx % RT_CONTACTS_PER_BIN
+            ax = jx >> 16
+            bx = (jx >> 8) & 0xff
+            cx = jx & 0xff
             if validate_nodeinfo(self.rt[ax][bx][cx]):
                 return self.rt[ax][bx][cx]
             elif not is_row_empty(self.rt[ax][bx][cx]):
                 memset(self.rt[ax][bx][cx], 0, NODEINFO_LEN)
                 self.rt_qual[ax][bx][cx] = MIN_QUAL
-                self.cnt['rt_scrubbed_bad_contact'] += 1
 
-        self.cnt['err_rt_no_contacts'] += 1
+        self.cnt[<int>ST.err_rt_no_contacts] += 1
         LOG.error('Could not find any random valid contact. RT in trouble!')
         return NULL
 
@@ -422,7 +460,9 @@ cdef class DHTScraper:
             list ihs
             u16 port
 
-        self.cnt['db_update_peers'] += 1
+        cdef cur_time = monotonic()
+
+        self.cnt[<int>ST.db_update_peers] += 1
 
         for peerinfo in peers:
             self._db_row_pool.append((ih, peerinfo))
@@ -445,10 +485,16 @@ cdef class DHTScraper:
                 self._db_row_pool,
             )
 
-            self.cnt['db_rows_inserted'] += len(self._db_row_pool)
+            cur_time = monotonic()
+            for ih in {row[0] for row in self._db_row_pool}:
+                if ih in self._ih_db_holdoff:
+                    del self._ih_db_holdoff[ih]
+                self._ih_recent_peer_cache.insert(ih, cur_time)
+
+            self.cnt[<int>ST.db_rows_inserted] += len(self._db_row_pool)
             self._db_row_pool.clear()
 
-    cdef void handle_new_nodes(self, u8 *pnodes, u64 n_nodes):
+    cdef void ping_new_nodes(self, u8 *pnodes, u64 n_nodes):
         '''
         Generic processor for all new found nodes.
 
@@ -457,7 +503,7 @@ cdef class DHTScraper:
 
         cdef u64 offset, status_code
         cdef bint did_replace
-        cdef dht_node ping_contact
+        cdef dht_node_t ping_contact
         cdef u8 bitmask = 0
         cdef u8 zx
 
@@ -467,19 +513,46 @@ cdef class DHTScraper:
             # this call; this is sufficient since most calls share ax and bx
             zx = 1 << ((pnodes[offset + 2] & 0xe0) >> 5)
             if zx & bitmask:
-                self.cnt['rt_newnode_drop_repeat'] += 1
+                self.cnt[<int>ST.rt_newnode_drop_dup] += 1
                 continue
 
             elif random() > self.ctl_ping_rate:
-                self.cnt['rt_newnode_drop_unlucky'] += 1
+                self.cnt[<int>ST.rt_newnode_drop_luck] += 1
                 continue
 
             bitmask |= zx
 
-            uncompact_nodeinfo(&ping_contact, pnodes + offset)
-            self.send_q_pg(&ping_contact)
+            if uncompact_nodeinfo(&ping_contact, pnodes + offset):
+                self.send_q_pg(&ping_contact)
+                self.cnt[<int>ST.rt_newnode_ping] += 1
+            else:
+                self.cnt[<int>ST.rt_newnode_invalid] += 1
 
-            self.cnt['rt_newnode_ping'] += 1
+    @cython.profile(False)
+    cdef inline object get_in_flight(self, bytes nid):
+        return self._ifl_dict.get(nid)
+
+    cdef bint put_in_flight(self, bytes nid, bytes ih):
+        if ih in self._ifl_ih_hold:
+            return 0
+        else:
+            self._ifl_dict[nid] = (ih, monotonic())
+            self._ifl_ih_hold.add(ih)
+            return 1
+
+    cdef void replace_in_flight(self, bytes old_nid, bytes new_nid):
+        ih = self._ifl_dict[old_nid][0]
+        del self._ifl_dict[old_nid]
+        self._ifl_dict[new_nid] = (ih, monotonic())
+
+    cdef bint del_in_flight(self, bytes nid):
+        if nid in self._ifl_dict:
+            ih = self._ifl_dict[nid][0]
+            del self._ifl_dict[nid]
+            self._ifl_ih_hold.remove(ih)
+            return 1
+        else:
+            return 0
 
     cdef void handle_gp_nodes(self, parsed_msg *krpc, tuple saddr):
         '''
@@ -490,51 +563,64 @@ cdef class DHTScraper:
         next node.
         '''
 
-        cdef dht_node followup_contact
-        cdef u8 cur_sim, best_sim
+        cdef dht_node_t followup_contact
+        cdef u64 base_sim, cur_sim, best_sim
+        cdef int offset
+        cdef int best_offset = -1
+        cdef double insert_time
+        cdef bytes ih
+        cdef bint got_bad_node = 0
+        cdef bint good
 
-        old_nid = krpc.nid[0:IH_LEN]
-        maybe_ih = self.info_in_flight.get(old_nid)
+        old_nid = krpc.nid[0:NIH_LEN]
 
-        if maybe_ih == 1:
-            # we matched peers for this, don't need nodes
+        ifl_rec = self.get_in_flight(old_nid)
+
+        if ifl_rec is None:
+            self.cnt[<int>ST.ih_nodes_unmatched] += 1
             return
 
-        if maybe_ih is None:
-            self.cnt['bm_gp_nodes_unmatched'] += 1
-            return
+        ih, insert_time = ifl_rec
 
-        del self.info_in_flight[old_nid]
-
-        self._rtt_buf[self._rtt_buf_ix] = monotonic() - maybe_ih[1]
+        self._rtt_buf[self._rtt_buf_ix] = monotonic() - insert_time
         self._rtt_buf_ix = (self._rtt_buf_ix + 1) % RTT_BUF_LEN
 
-        target_ih = maybe_ih[0]
+        base_sim = best_sim = sim_kad_apx(old_nid, ih)
 
-        # NOTE: experiments have shown that selecting the best contact
-        # does not better than just picking the first
-        uncompact_nodeinfo(&followup_contact, krpc.nodes)
-        
-        if not followup_contact.valid:
-            self.cnt['bm_gp_node_invalid'] += 1
-            self.rt_adj_quality(old_nid, -2)
+        for offset in range(0, krpc.n_nodes * NODEINFO_LEN, NODEINFO_LEN):
+
+            if not uncompact_nodeinfo(&followup_contact, krpc.nodes + offset):
+                got_bad_node = 1
+                continue
+
+            cur_sim = sim_kad_apx(followup_contact.nid, ih)
+
+            if cur_sim < base_sim:
+                got_bad_node = 1
+                continue
+
+            # accept same sim to get a new node
+            if cur_sim >= best_sim:
+                best_sim = cur_sim
+                best_offset = offset
+
+        if best_offset < 0:
+            self.cnt[<int>ST.bm_nodes_invalid] += 1
+            self.rt_adj_quality(old_nid, -3)
             return
+        elif got_bad_node:
+            self.rt_adj_quality(old_nid, 1)
+        else:
+            self.rt_adj_quality(old_nid, 3)
 
-        cur_sim = sim_kad_apx(followup_contact.nid, target_ih)
-        best_sim = sim_kad_apx(old_nid, target_ih)
+        self.cnt[<int>ST.ih_nodes_matched] += 1
+        uncompact_nodeinfo(&followup_contact, krpc.nodes + best_offset)
 
-        if cur_sim <= best_sim:
-            self.cnt['bm_gp_node_too_far'] += 1
-            self.rt_adj_quality(old_nid, -2)
-            return
+        self._dkad_buf[self._dkad_buf_ix] = best_sim - base_sim
+        self._dkad_buf_ix = (self._dkad_buf_ix + 1) % DKAD_BUF_LEN
 
-        self.cnt['ih_got_good_next_hop'] += 1
-        self.rt_adj_quality(old_nid, 3)
-
-        self.send_q_gp(target_ih, &followup_contact, 1)
-        # XXX bytes conversion
-        self.info_in_flight[followup_contact.nid[0:NID_LEN]] =\
-            (target_ih, monotonic())
+        self.send_q_gp(ih, &followup_contact, 1)
+        self.replace_in_flight(old_nid, followup_contact.nid[0:NIH_LEN])
 
 
     cdef void handle_new_peers(self, u8 *nid, u8 *peers, u64 n_peers):
@@ -545,14 +631,11 @@ cdef class DHTScraper:
         cdef object maybe_ih
         cdef bint got_bad_peer = 0
 
-        # FIXME
-        maybe_ih = self.info_in_flight.get(nid[0:IH_LEN])
+        maybe_ih = self.get_in_flight(nid[0:NIH_LEN])
 
-        if maybe_ih is not None and maybe_ih != 1:
+        if maybe_ih is not None:
 
-            self.cnt['ih_matched_peers'] += 1
-            # NOTE: mark for the node parse that we matched
-            self.info_in_flight[nid[0:IH_LEN]] = 1
+            self.cnt[<int>ST.ih_peers_matched] += 1
 
             for offset in range(0, n_peers * PEERINFO_LEN, PEERINFO_LEN):
 
@@ -563,27 +646,25 @@ cdef class DHTScraper:
                 good_peers.append(peers[offset:offset + 6])
 
         else:
-            self.cnt['bm_unmatched_peers'] += 1
+            self.cnt[<int>ST.ih_peers_unmatched] += 1
             return
 
-        ih = maybe_ih[0]
-
         if len(good_peers) == 0:
-            self.cnt['bm_no_good_peers'] += 1
+            self.cnt[<int>ST.bm_peers_bad] += 1
             self.rt_adj_quality(nid, -3)
             return
 
         elif got_bad_peer:
-            self.cnt['bm_some_bad_peers'] += 1
             self.rt_adj_quality(nid, -1)
 
-        self.db_update_peers(ih, good_peers)
+        self.db_update_peers(maybe_ih[0], good_peers)
+        self.del_in_flight(nid[0:NIH_LEN])
 
     # XXX get rid of tuple conversion
     cdef void handle_msg(self, bytes d, tuple saddr):
 
         cdef parsed_msg krpc
-        cdef bd_status status
+        cdef u64 status
         cdef u64 replace_status
         cdef u16 ap_port
         cdef str decoded_name
@@ -592,29 +673,31 @@ cdef class DHTScraper:
         saddr = (saddr[0].encode('ascii'), saddr[1])
 
         status = krpc_bdecode(d, &krpc)
-        self.cnt[f'st_{bd_status_names[status]}'] += 1
+        self.cnt[status] += 1
 
-        if status != bd_status.NO_ERROR:
+        if status != ST.bd_a_no_error:
             IF BD_TRACE:
-                if status == bd_status.FALLTHROUGH:
+                if status == ST.err_bd_fallthrough:
                     print('')
                     print(d)
                     print('\n'.join(g_trace))
             return
 
-        if krpc.method == krpc_msg_type.Q_AP:
-            self.cnt['rx_q_ap'] += 1
+        if krpc.method == MSG_Q_AP:
+            self.cnt[<int>ST.rx_q_ap] += 1
 
             replace_status = self.rt_add_sender_as_contact(&krpc, saddr, 3)
 
             if krpc.token_len != 1 or krpc.token[0] != TOKEN:
-                self.cnt['bm_ap_bad_token'] += 1
+                self.cnt[<int>ST.bm_ap_bad_token] += 1
                 return
 
             if krpc.ap_implied_port:
                 ap_port = <u16> saddr[1]
             else:
                 ap_port = krpc.ap_port
+
+            ih = krpc.ih[0:NIH_LEN]
 
             if krpc.ap_name_len > 0:
 
@@ -624,55 +707,56 @@ cdef class DHTScraper:
                     # XXX faster utf8 checking
                     decoded_name = raw_ap_name.decode('utf-8')
                 except UnicodeDecodeError:
-                    self.cnt['bm_ap_bad_name'] += 1
+                    self.cnt[<int>ST.bm_ap_bad_name] += 1
                     return
 
-                ih = krpc.ih[0:20]
-
-                    # FIXME: descriptions
-                self.db_update_peers(ih, [compact_peerinfo_bytes(saddr[0], ap_port)])
                 self._db_desc_pool[ih] = raw_ap_name
 
+            self.db_update_peers(ih, [compact_peerinfo_bytes(saddr[0], ap_port)])
             self.send_r_pg(krpc.nid, krpc.tok[0:krpc.tok_len], saddr, 1)
 
-        elif krpc.method == krpc_msg_type.Q_FN:
-            self.cnt['rx_q_fn'] += 1
+        elif krpc.method == MSG_Q_FN:
+            self.cnt[<int>ST.rx_q_fn] += 1
             self.rt_add_sender_as_contact(&krpc, saddr, 2)
 
-            pnode = self.rt_get_valid_neighbor_contact(krpc.target[0:IH_LEN])
-            self.send_r_fn(pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
+            pnode = self.rt_get_valid_neighbor_contact(krpc.target[0:NIH_LEN])
+            if pnode != NULL:
+                self.send_r_fn(
+                    pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
 
-        elif krpc.method == krpc_msg_type.Q_GP:
-            self.cnt['rx_q_gp'] += 1
+        elif krpc.method == MSG_Q_GP:
+            self.cnt[<int>ST.rx_q_gp] += 1
             self.rt_add_sender_as_contact(&krpc, saddr, 2)
             # FIXME this check is too slow, need to move to rolling bloom
             # filters
 
-            new_ih = krpc.ih[0:IH_LEN]
-            self._db_new_ih_staging.add(new_ih)
+            new_ih = krpc.ih[0:NIH_LEN]
+            if random() > self.ctl_ihash_discard:
+                self.cnt[<int>ST.ih_move_rx_to_staging] += 1
+                self._db_new_ih_staging.add(new_ih)
 
             pnode = self.rt_get_valid_neighbor_contact(krpc.ih)
             if pnode != NULL:
                 self.send_r_gp(
                     pnode, krpc.nid, krpc.tok[0:krpc.tok_len], saddr)
 
-        elif krpc.method == krpc_msg_type.Q_PG:
-            self.cnt['rx_q_pg'] += 1
+        elif krpc.method == MSG_Q_PG:
+            self.cnt[<int>ST.rx_q_pg] += 1
             self.rt_add_sender_as_contact(&krpc, saddr, 1)
 
             self.send_r_pg(krpc.nid, krpc.tok[0:krpc.tok_len], saddr, 0)
 
-        elif krpc.method == krpc_msg_type.R_GP:
-            self.cnt['rx_r_gp'] += 1
+        elif krpc.method == MSG_R_GP:
+            self.cnt[<int>ST.rx_r_gp] += 1
 
             if krpc.n_peers > 0:
-                self.cnt['rx_r_gp_v'] += 1
+                self.cnt[<int>ST.rx_r_gp_values] += 1
                 self.handle_new_peers(krpc.nid, krpc.peers, krpc.n_peers)
 
             # NOTE yes, ignore nodes from responses with peers
             elif krpc.n_nodes > 0:
-                self.cnt['rx_r_gp_n'] += 1
-                self.handle_new_nodes(krpc.nodes, krpc.n_nodes)
+                self.cnt[<int>ST.rx_r_gp_nodes] += 1
+                self.ping_new_nodes(krpc.nodes, krpc.n_nodes)
                 self.handle_gp_nodes(&krpc, saddr)
 
             elif krpc.n_peers + krpc.n_nodes == 0:
@@ -681,43 +765,45 @@ cdef class DHTScraper:
                         print(d)
                         print('\n'.join(g_trace))
                         return
-                self.cnt['err_r_gp_empty_peers'] += 1
+                self.cnt[<int>ST.err_bd_empty_r_gp] += 1
 
-        elif krpc.method == krpc_msg_type.R_FN:
-            self.cnt['rx_r_fn'] += 1
+        elif krpc.method == MSG_R_FN:
+            self.cnt[<int>ST.rx_r_fn] += 1
             if krpc.n_nodes == 0:
                 IF BD_TRACE:
                     print('EMPTY NODES IN R_FN')
                     print(d)
                     print('\n'.join(g_trace))
                     return
-                self.cnt['err_r_fn_empty_nodes'] += 1
+                self.cnt[<int>ST.err_bd_empty_r_gp] += 1
 
             # these nodes are usually close, so set only one
-            self.handle_new_nodes(krpc.nodes, 1)
+            self.ping_new_nodes(krpc.nodes, 1)
 
-        elif krpc.method == krpc_msg_type.R_PG:
+        elif krpc.method == MSG_R_PG:
             self.rt_add_sender_as_contact(&krpc, saddr, 2)
-            self.cnt['rx_r_pg'] += 1
+            self.cnt[<int>ST.rx_r_pg] += 1
 
         else:
             IF BD_TRACE:
                 print('HANDLE FALLTHROUGH')
                 print(d)
                 print('\n'.join(g_trace))
-            self.cnt['err_handle_fallthrough'] += 1
+            self.cnt[<int>ST.err_bd_handle_fallthrough] += 1
 
     # FIXME implement
     cdef void send_sample_infohashes(self, bytes nid, tuple addr):
         pass
 
-    cdef void send_q_fn_random(self, dht_node *dest):
+    cdef void send_q_fn_random(self, dht_node_t *dest):
         cdef bytearray random_target = bytearray(rbytes(20))
         random_target[0] = dest.nid[0]
         random_target[1] = dest.nid[1]
-        self.send_q_fn(rbytes(IH_LEN), dest)
+        random_target[2] = dest.nid[2]
+        random_target[3] = dest.nid[3]
+        self.send_q_fn(rbytes(NIH_LEN), dest)
 
-    cdef void send_q_fn(self, u8 *target, dht_node *dest):
+    cdef void send_q_fn(self, u8 *target, dht_node_t *dest):
         '''
         Solicit a new random node based on our current self id and the current
         state
@@ -725,34 +811,36 @@ cdef class DHTScraper:
         cdef u8 msg_buf[Q_FN_LEN]
 
         memcpy(msg_buf,                      Q_FN_PROTO, Q_FN_LEN)
-        memcpy(msg_buf + Q_FN_TARGET_OFFSET, target,     NID_LEN)
+        memcpy(msg_buf + Q_FN_TARGET_OFFSET, target,     NIH_LEN)
         mk_sid_raw(msg_buf + Q_FN_SID_OFFSET, dest.nid)
 
         # XXX bytes conversion
         self.listener.send_msg(
-            msg_buf[:Q_FN_LEN], node_to_addr_tup(dest),
-            0, dest.nid[NID_LEN - 1],
-            'tx_q_fn',
+            msg_buf[:Q_FN_LEN], mk_addr_from_dht_node(dest),
+            0, dest.nid[NIH_LEN - 1],
+            ST.tx_q_fn,
         )
 
-    cdef void send_q_gp(self, u8 *ih, dht_node *dest, u64 prio):
+    cdef void send_q_gp(self, u8 *ih, dht_node_t *dest, u64 prio):
         '''
         Send get_peers query.
         '''
         cdef u8 msg_buf[Q_GP_LEN]
 
-        memcpy(msg_buf,                    Q_GP_PROTO, Q_GP_LEN)
-        memcpy(msg_buf + Q_GP_IH_OFFSET,     ih,         IH_LEN)
+        memcpy(    msg_buf,                   Q_GP_PROTO, Q_GP_LEN)
+        memcpy(    msg_buf + Q_GP_IH_OFFSET,  ih,         NIH_LEN)
         mk_sid_raw(msg_buf + Q_GP_SID_OFFSET, dest.nid)
 
         # XXX bytes conversion
         self.listener.send_msg(
-            msg_buf[:Q_GP_LEN], node_to_addr_tup(dest),
-            prio, dest.nid[NID_LEN - 1],
-            'tx_q_gp',
+            msg_buf[:Q_GP_LEN], mk_addr_from_dht_node(dest),
+            prio, dest.nid[NIH_LEN - 1],
+            ST.tx_q_gp,
         )
 
-    cdef void send_q_pg(self, dht_node *dest):
+        # print(msg_buf[:Q_GP_LEN])
+
+    cdef void send_q_pg(self, dht_node_t *dest):
         cdef u8 msg_buf[Q_PG_LEN]
 
         memcpy(msg_buf, Q_PG_PROTO, Q_PG_LEN)
@@ -760,10 +848,10 @@ cdef class DHTScraper:
 
         # XXX bytes conversion
         self.listener.send_msg(
-            msg_buf[:Q_PG_LEN], node_to_addr_tup(dest),
+            msg_buf[:Q_PG_LEN], mk_addr_from_dht_node(dest),
             0,
-            dest.nid[NID_LEN - 1],
-            'tx_q_pg',
+            dest.nid[NIH_LEN - 1],
+            ST.tx_q_pg,
         )
 
     cdef void send_r_fn(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
@@ -775,8 +863,8 @@ cdef class DHTScraper:
             ),
             addr,
             0,
-            nid[NID_LEN - 1],
-            'tx_r_fn',
+            nid[NIH_LEN - 1],
+            ST.tx_r_fn,
         )
 
     cdef void send_r_pg(self, u8 *nid, bytes tok, tuple daddr, u64 prio):
@@ -790,8 +878,8 @@ cdef class DHTScraper:
             ),
             daddr,
             prio,
-            nid[NID_LEN - 1],
-            'tx_r_pg',
+            nid[NIH_LEN - 1],
+            ST.tx_r_pg,
         )
 
     cdef void send_r_gp(self, u8 *pnode, u8 *nid, bytes tok, tuple addr):
@@ -808,51 +896,59 @@ cdef class DHTScraper:
             ),
             addr,
             0,
-            nid[NID_LEN - 1],
-            'tx_r_gp',
+            nid[NIH_LEN - 1],
+            ST.tx_r_gp,
         )
 
     @aio_loop_method(GP_SLEEP)
     def loop_get_peers(self):
 
-        cdef dht_node gp_contact
+        cdef dht_node_t gp_contact
         cdef u8 *pnode
         cdef bytes bnid, ih
+        cdef object val
 
-        while len(self.info_in_flight) < self.ctl_ifl_target:
-            try:
-                ih = self.naked_ihashes.pop()
-            except IndexError:
-                self.cnt['ih_raw_ihs_exhausted'] += 1
+        while len(self._ifl_dict) < self.ctl_ifl_target:
 
+            val = self.naked_ihashes.poptail()
+
+            if val is LRU_EMTPY:
+                self.cnt[<int>ST.ih_naked_exhausted] += 1
                 pnode = self.rt_get_random_valid_node()
                 if pnode != NULL:
-                    uncompact_nodeinfo(&gp_contact, pnode)
-                    self.send_q_fn_random(&gp_contact)
-
+                    if uncompact_nodeinfo(&gp_contact, pnode):
+                        self.send_q_fn_random(&gp_contact)
+                    else:
+                        self.cnt[<int>ST.err_rt_pulled_bad_node] += 1
                 return
+
+            ih = val[0]
 
             # try to get a node close to the infohash
             pnode = self.rt_get_valid_neighbor_contact(ih)
             if pnode != NULL:
 
-                uncompact_nodeinfo(&gp_contact, pnode)
-                bnid = gp_contact.nid[0:NID_LEN]
+                if not uncompact_nodeinfo(&gp_contact, pnode):
+                    self.cnt[<int>ST.err_rt_pulled_bad_node] += 1
+                    continue
 
-                if bnid in self.info_in_flight:
-                    self.cnt['ih_node_already_in_ifl'] += 1
+                nid = gp_contact.nid[0:NIH_LEN]
+
+                if nid in self._ifl_dict:
+                    self.cnt[<int>ST.ih_move_naked_duplicate] += 1
                 else:
                     self.send_q_gp(ih, &gp_contact, 1)
-                    self.info_in_flight[bnid] = (ih, monotonic())
-                    self.cnt['ih_naked_ih_put_in_ifl'] += 1
-
+                    self._ih_gp_holdoff[ih] = monotonic()
+                    self.put_in_flight(nid, ih)
+                    self.cnt[<int>ST.ih_move_naked_to_hold] += 1
                 continue
 
-            self.cnt['ih_no_good_neighbors'] += 1
             pnode = self.rt_get_random_valid_node()
             if pnode != NULL:
-                uncompact_nodeinfo(&gp_contact, pnode)
-                self.send_q_fn(ih, &gp_contact)
+                if uncompact_nodeinfo(&gp_contact, pnode):
+                    self.send_q_fn(ih, &gp_contact)
+                else:
+                    self.cnt[<int>ST.err_rt_pulled_bad_node] += 1
 
     @aio_loop_method(FP_SLEEP)
     def loop_find_nodes(self):
@@ -863,45 +959,68 @@ cdef class DHTScraper:
         as possible, and to refresh the routing table.
         '''
 
-        cdef dht_node fn_contact
+        cdef dht_node_t fn_contact
         cdef u8 *pnode
 
         pnode = self.rt_get_random_valid_node()
         if pnode != NULL:
-            uncompact_nodeinfo(&fn_contact, pnode)
-            self.send_q_fn_random(&fn_contact)
+            if uncompact_nodeinfo(&fn_contact, pnode):
+                self.send_q_fn_random(&fn_contact)
+            else:
+                self.cnt[<int>ST.err_rt_pulled_bad_node] += 1
+
+    @aio_loop_method(HO_PURGE_SLEEP)
+    def loop_purge_holdoffs(self):
+
+        # gp holdoff
+        cdef double purge_thresh = monotonic() - BASE_IH_GP_HOLDOFF
+
+        cdef set unhold_ihs = {
+            ih for ih, t in self._ih_gp_holdoff.items()
+            if t < purge_thresh
+        }
+
+        for unih in unhold_ihs:
+            self._db_new_ih_staging.add(unih)
+            del self._ih_gp_holdoff[unih]
+        self.cnt[<int>ST.ih_move_hold_to_staging] += len(unhold_ihs)
+
+        # db holdoff
+        purge_thresh = monotonic() - BASE_IH_DB_HOLDOFF
+
+        unhold_ihs = {
+            ih for ih, t in self._ih_db_holdoff.items()
+            if t < purge_thresh
+        }
+
+        for unih in unhold_ihs:
+            del self._ih_db_holdoff[unih]
+        self.cnt[<int>ST.ih_unhold_db] += len(unhold_ihs)
 
     @aio_loop_method(PURGE_SLEEP, init_sleep=5.0)
     def loop_purge_ifl(self):
         '''
-        Purges the info_in_flight tables of requests that have timed out
-        or been moved on to the next hop.
+        Purges the in-flight state to remove timed-out requests.
+
+        Downvotes nodes to which requests timed out.
         '''
 
-        timeout_thresh = monotonic() - self.ctl_timeout
+        cdef double cur_time = monotonic()
+        cdef double timeout_thresh = cur_time - self.ctl_timeout
+        cdef double put_time
+        cdef bytes nid, ih
+        cdef dict bad_nids = {}  # nid: is nid unconsumed?
 
         bad_nids = {
-            k for k, v in self.info_in_flight.items()
-            if (v is None) or (v == 1) or (v[1] < timeout_thresh)
+            nid: ih
+            for nid, (ih, put_time) in self._ifl_dict.items()
+            if put_time < timeout_thresh
         }
 
-        for bad_nid in bad_nids:
-            try:
-                maybe_ih = self.info_in_flight[bad_nid]
-                if maybe_ih is not None and maybe_ih != 1:
-                    ih = maybe_ih[0]
-                    if random() > self.ctl_ihash_discard:
-                        self.naked_ihashes.appendleft(ih)
-
-                # minor penalty for not responding - not as bad as
-                # giving us bogus info of various kinds.
-                self.rt_adj_quality(bad_nid, -1)
-
-                del self.info_in_flight[bad_nid]
-                self.cnt['ih_stale_ifl_purged'] += 1
-
-            except KeyError:
-                self.cnt['err_to_purge_disappeared'] += 1
+        for nid, ih in bad_nids.items():
+            del self._ifl_dict[nid]
+            self._ifl_ih_hold.remove(ih)
+            self.rt_adj_quality(nid, -2)
 
     @aio_loop_method(IH_DESC_SLEEP, init_sleep=IH_DESC_SLEEP)
     def loop_dump_descs(self):
@@ -933,12 +1052,29 @@ cdef class DHTScraper:
         using a temporary table.
         '''
 
-        cdef list staged_ihs = sorted(
-            self._db_new_ih_staging - self.info_in_flight.keys()
+        self.cnt[<int>ST.ih_stage_n_raw] += len(self._db_new_ih_staging)
+        # first, exclude held-off and in-flight keys
+        cdef set base_stage_ihs = self._db_new_ih_staging.difference(
+            self._ih_gp_holdoff.keys(),
+            self.naked_ihashes.d.keys(),
+            self._ih_recent_peer_cache.d.keys(),
+            self._ifl_ih_hold,
         )
-        self._db_new_ih_staging.clear()
+        self.cnt[<int>ST.ih_stage_n_prefiltered] += len(base_stage_ihs)
 
-        self.cnt['ih_staged_all'] += len(staged_ihs)
+        # keys in the ih_db_holdoff set have passed the database test recently
+        # and so are set to be staged
+        cdef set recycled_ihs = base_stage_ihs & self._ih_db_holdoff.keys()
+
+        # base_stage_keys\recycled_ihs are the ones we need to look up
+        cdef list ihs_to_lookup = sorted(
+            base_stage_ihs - self._ih_db_holdoff.keys()
+        )
+
+        self.cnt[<int>ST.ih_stage_n_recycled] += len(recycled_ihs)
+        self.cnt[<int>ST.ih_stage_n_lookup] += len(ihs_to_lookup)
+
+        self._db_new_ih_staging.clear()
 
         # clear current scratch table
         self._db.execute(
@@ -953,7 +1089,7 @@ cdef class DHTScraper:
             INSERT INTO `cand_ihashes` (`info_hash`)
             VALUES (%s)
             ''',
-            staged_ihs,
+            ihs_to_lookup,
         )
         # batch lookup the timestamps (potentially null for new ihs)
         self._db.execute(
@@ -973,28 +1109,32 @@ cdef class DHTScraper:
             '''
         )
 
-        staged_ihs = [row[0] for row in self._db.fetchall()]
-        self.cnt['ih_staged_new'] += len(staged_ihs)
-        self.naked_ihashes.extendleft(staged_ihs)
-            
+        cdef list ih_results = [row[0] for row in self._db.fetchall()]
+        cdef double cur_time = monotonic()
+
+        for recycled_ih in recycled_ihs:
+            self.naked_ihashes.insert(recycled_ih, cur_time)
+
+        self.cnt[<int>ST.ih_move_staging_to_naked] += len(ih_results)
+        self.cnt[<int>ST.ih_move_staging_to_naked] += len(recycled_ihs)
+
+        for staged_ih in ih_results:
+            self._ih_db_holdoff[staged_ih] = cur_time
+            self.naked_ihashes.insert(staged_ih, cur_time)
+
     @aio_loop_method(BOOTSTRAP_SLEEP, init_sleep=BOOTSTRAP_SLEEP)
-    def loop_boostrap(self):
-        cdef dht_node new_contact
+    def loop_bootstrap(self):
+        cdef dht_node_t new_contact
 
         if self.metric_rt_fullness() < 0.01:
             for addr in BOOTSTRAP:
                 # FIXME this is a lot of useless conversion an deconversion
                 # harmless in low freq. bootstrap, but still...
-                memcpy_bytes(new_contact.nid, rbytes(NID_LEN), NID_LEN)
-                memcpy_bytes(new_contact.ip, inet_aton(addr[0]), IP_LEN)
+                memcpy_bytes(new_contact.nid, rbytes(NIH_LEN), NIH_LEN)
+                memcpy_bytes(new_contact.pip, inet_aton(addr[0]), IP_LEN)
                 new_contact.port = addr[1]
 
-                if validate_ip_p(new_contact.ip) and\
-                        validate_port(new_contact.port):
-                    new_contact.valid = 1
-                    self.send_q_fn_random(&new_contact)
-                else:
-                    self.cnt['err_bootstrap_bad_contact'] += 1
+                self.send_q_fn_random(&new_contact)
 
     @aio_loop_method(SAVE_SLEEP, init_sleep=SAVE_SLEEP)
     def loop_save_data(self):
@@ -1010,124 +1150,146 @@ cdef class DHTScraper:
 
         cdef double t = monotonic()
         cdef double dt = t - self._control_mark
-        self._control_mark = t
+        cdef int ix
 
-        dcnt = self.cnt - self._ctl_cnt
-        self._ctl_cnt = self.cnt.copy()
+        self._control_mark = t
+        dcnt = Counter()
+        for ix in range(<int>ST._ST_ENUM_END):
+            dcnt[<bytes>ST_names[ix]] += (self.cnt[ix] - self._ctl_cnt[ix])
+            self._ctl_cnt[ix] = self.cnt[ix]
 
         cdef double gpps = dcnt['rx_q_gp'] / dt
 
-        self.ctl_reply_rate = max(0.0, min(
-                1.0,
-                1 - (gpps - GPPS_RX_TARGET) / (GPPS_RX_MAX - GPPS_RX_TARGET)
-            ))
+        self.ctl_reply_rate = min(1.0, GPPS_RX_TARGET / (1 + gpps))
 
         self.ctl_ihash_discard = len(self.naked_ihashes) / IH_POOL_LEN
-        self.ctl_ping_rate = (1 - self.ctl_ihash_discard) / 10
+        self.ctl_ping_rate = (1 - self.ctl_ihash_discard)
 
         rtt_stat = self.metric_gp_rtt()
-        self.ctl_timeout = max(0.1, rtt_stat.mean + 3 * rtt_stat.std)
+        self.ctl_timeout = max(0.5, rtt_stat.mean + 3 * rtt_stat.std)
 
     @aio_loop_method(INFO_SLEEP, init_sleep=INFO_SLEEP)
     def loop_info(self):
 
         cdef double t = monotonic()
         cdef double dt = t - self._info_mark
+        cdef int ix
 
         self._info_mark = t
 
-        raw_dcnt = self.cnt - self._disp_cnt
-        self._disp_cnt = self.cnt.copy()
+        dcnt = Counter()
+        printcnt = Counter()
+        for ix in range(<int>ST._ST_ENUM_END):
+            printcnt[<bytes>ST_names[ix].decode('ascii')] = self.cnt[ix]
+            if self.cnt[ix] != self._disp_cnt[ix]:
+                dcnt[<bytes>ST_names[ix].decode('ascii')] =\
+                    (self.cnt[ix] - self._disp_cnt[ix])
+                self._disp_cnt[ix] = self.cnt[ix]
+
+            # print(self.cnt[ix], ST_names[ix].decode('ascii'))
 
         # get peers response rate
-        gprr = min(1.0, raw_dcnt["rx_r_gp"] / (raw_dcnt["tx_q_gp"] + 1))
+        gprr = min(1.0, dcnt["rx_r_gp"] / (dcnt["tx_q_gp"] + 1))
         # values to nodes ratio (in gp_response)
-        vnr = (raw_dcnt["rx_r_gp_v"] + 1) / (raw_dcnt["rx_r_gp_n"] + 1)
+        vnr = (dcnt["rx_r_gp_values"] + 1) / (dcnt["rx_r_gp_nodes"] + 1)
         # db accept rate (number of new infohashes not in db already)
-        newih, allih = raw_dcnt["ih_staged_new"] + 1, raw_dcnt["ih_staged_all"] + 1
+        newih, allih = dcnt["ih_staged_new"] + 1, dcnt["ih_staged_db_lookup"] + 1
         newr = newih / allih
 
         # get peers round trip time
         rtt = self.metric_gp_rtt()
-        
+
         # routing table replacement rate
-        rts = raw_dcnt["rt_replace_accept"] + 1
-        rtf = raw_dcnt["rt_replace_reject"] + 1
-        rtx = raw_dcnt["rt_replace_bad_node"] + 1
+        rts = dcnt["rt_replace_accept"] + 1
+        rtf = dcnt["rt_replace_reject"] + 1
+        rtx = dcnt["rt_replace_invalid"] + 1
         rt_rr  = rts / (rts + rtf + rtx)
 
-        newr = (raw_dcnt["ih_staged_new"] + 1) / (raw_dcnt["ih_staged_all"] + 1)
+        newr = (dcnt["ih_move_staging_to_naked"] + 1) /\
+            (dcnt["ih_stage_n_prefiltered"] + 1)
 
-        x = Counter()
-        x.update({k: int(v / dt) for k, v in raw_dcnt.items()})
+        x = Counter(
+            {k: int(v / dt) for k, v in dcnt.items() if v > 0}
+        )
 
-        self.cnt['perf_rtrr'] = rt_rr
-        self.cnt['perf_rr_gp'] = gprr
-        self.cnt['perf_rr_fn'] =\
-            min(1.0, (raw_dcnt['rx_r_fn'] + 1) / (raw_dcnt['tx_q_fn'] + 1))
-        self.cnt['perf_rr_pg'] =\
-            min(1.0, (raw_dcnt['rx_r_pg'] + 1) / (raw_dcnt['tx_q_pg'] + 1))
+        printcnt['perf_rr_gp'] = gprr
+        printcnt['perf_rr_fn'] =\
+            min(1.0, (dcnt['rx_r_fn'] + 1) / (dcnt['tx_q_fn'] + 1))
+        printcnt['perf_rr_pg'] =\
+            min(1.0, (dcnt['rx_r_pg'] + 1) / (dcnt['tx_q_pg'] + 1))
 
-        self.cnt['perf_rr_tot'] = min(
+        printcnt['perf_rr_tot'] = min(
             1.0,
             (
-                raw_dcnt['rx_r_fn'] +
-                raw_dcnt['rx_r_pg'] +
-                raw_dcnt['rx_r_gp'] + 1
+                dcnt['rx_r_fn'] +
+                dcnt['rx_r_pg'] +
+                dcnt['rx_r_gp'] + 1
             ) / (
-                raw_dcnt['tx_q_fn'] +
-                raw_dcnt['tx_q_pg'] +
-                raw_dcnt['tx_q_gp'] + 1
+                dcnt['tx_q_fn'] +
+                dcnt['tx_q_pg'] +
+                dcnt['tx_q_gp'] + 1
             )
         )
 
-        self.cnt['perf_rtt_ms'] = 1000. * rtt.mean
-        self.cnt['perf_rtt_ms_std'] = 1000. * rtt.std
+        printcnt['perf_net_rtt_ms'] = 1000. * rtt.mean
+        printcnt['perf_net_rtt_ms_std'] = 1000. * rtt.std
 
-        self.cnt['perf_db_newr'] = newr
+        printcnt['perf_db_newr'] = newr
+
+        printcnt['perf_rt_fullness'] = self.metric_rt_fullness()
+        printcnt['perf_rt_qual'] = self.metric_av_quality()
+        printcnt['perf_rt_replace_rate'] = rt_rr
+        printcnt['perf_gp_av_dkad'] = self.metric_av_dkad()
 
         info = (
             f'{format_uptime(int(monotonic() - self._start_time)):>9s} | '  # len 11
             f'{x["rx_q_pg"]:>5d} '  # len 6
             f'{x["rx_q_fn"]:>5d} {x["rx_r_fn"]:>5d} '  # len 12
-            f'{x["rx_q_gp"]:>5d} '  # len 12
-            f'{x["rx_r_gp_v"]:>5d} {x["rx_r_gp_n"]:>5d} '
+            f'{x["rx_q_gp"]:>5d} {x["rx_r_gp"]:>5d} '  # len 12
             f'{x["rx_q_ap"]:>5d} | '  # len 11
             f'{x["tx_q_fn"]:>5d} {x["tx_r_fn"]:>5d} {x["tx_q_gp"]:>5d} '  # len 18
             f'{x["tx_r_gp"]:>5d} {x["tx_q_pg"]:>5d} '  # len 12
             f'{x["tx_r_pg"]:>5d} | '  # len 6
-            f'{x["db_update_peers"]:>4d} {x["db_rows_inserted"]:>5d} ' #  len 10
-            f'{x["ih_staged_all"]:>5d} {newr:5.3f} | '  # len 14
+            f'{x["db_update_peers"]:>4d} {x["db_rows_inserted"]:>5d} | ' #  len 13
+            f'{x["ih_move_naked_to_hold"]:>5d} '
+            f'{x["ih_move_rx_to_staging"]:>5d} '
+            f'{x["ih_move_hold_to_staging"]:>5d} '
+            f'{x["ih_move_staging_to_naked"]:>5d} | '
             f'{gprr:>4.2f}({self.ctl_reply_rate:>4.2f}) ' # len 11
             f'{self.ctl_ifl_target:>4d} {vnr:4.2f} '  # len 15
             f'{int(1000 * rtt.mean):>3d}±{int(1000 * rtt.std):>3d} | '  # len 10
-            f'{self.metric_av_quality():>4.2f} {rt_rr:4.2f} | '  # len 11
+            f'{self.metric_av_quality():>4.2f} {rt_rr:4.2f} ' # len 10
+            f'{x["rt_missing_neighbor"]:>4d} | '  # len 11
         )
 
         header_high = (
             '--STATS---| '
-            '------------------ RX ------------------- | '
+            '---------------- RX --------------- | '
             '---------------- TX --------------- | '
-            '--------- DB -------- | '
+            '--- DB --- | '
+            '--------- IH ---------- | '
             '------------ PERF ---------- | '
-            '--- RT -- |'
+            '----- RT ----- |'
         )
 
         header_low = (
             '  uptime  | '
             ' ping '
             '   fn  r_fn '
-            '   gp '
-            'gp_rv gp_rn '
+            '   gp  r_gp '
             '   ap | '
             '   fn  r_fn    gp '
-            ' gp_r    pg  pg_r | '
-            'dbup  dbnr '
-            '  stg  newr | '
+            ' r_gp    pg  r_pg | '
+            'dbup  dbnr | '
+            ' n->h '
+            'rx->s '
+            ' h->s '
+            ' s->n | '
             'gprr (own) '
             'load  vnr '
             'rtt(ms) | '
-            'qual rtrr |'
+            'qual rtrr '
+            'miss |'
         )
 
         if not self._info_iter:
@@ -1138,7 +1300,7 @@ cdef class DHTScraper:
         self._info_iter = (self._info_iter + 1) % INFO_HEADER_EVERY
 
         with open(INFO_FILE, 'w') as f:
-            f.write(self.format_detailed_info())
+            f.write(self.format_detailed_info(printcnt))
 
     def run(self):
         # XXX fixme cython time jitters all over the place on startup,
@@ -1147,10 +1309,13 @@ cdef class DHTScraper:
         self._start_time = monotonic()
         self._info_mark = self._control_mark = monotonic()
 
+        memset(self.rt, 0, 256 * 256 * 256 * NODEINFO_LEN)
+        memset(self.rt_qual, 0, 256 * 256 * 256)
+
         self.load_data()
 
         run_listener = self.loop.create_datagram_endpoint(
-            lambda: self.listener, local_addr=('0.0.0.0', DHT_LPORT)
+            lambda: self.listener, local_addr=(DHT_LHOST, DHT_LPORT)
         )
 
         # order matters here
@@ -1159,10 +1324,11 @@ cdef class DHTScraper:
                 run_listener,
                 self.loop_info(),
                 self.loop_control(),
-                self.loop_boostrap(),
+                # self.loop_bootstrap(),  #  XXX as argument
                 self.loop_stage_new_ihashes(),
                 self.loop_dump_descs(),
                 self.loop_purge_ifl(),
+                self.loop_purge_holdoffs(),
                 self.loop_get_peers(),
                 self.loop_find_nodes(),
                 self.loop_save_data(),
@@ -1178,7 +1344,7 @@ cdef class DHTScraper:
 
         self.loop.run_forever()
 
-    cdef str format_detailed_info(self):
+    cdef str format_detailed_info(self, counter):
         '''
         Prints tables of detailed information on request.
         '''
@@ -1190,20 +1356,20 @@ cdef class DHTScraper:
         cdef int field_width = key_width + num_width
         cdef int padded_field_width = 2 * pad_width + field_width
 
-        unique_prefixes = {s.split('_')[0] for s in self.cnt if '_' in s}
+        unique_prefixes = {s.split('_')[0] for s in counter if '_' in s}
         tables = {prefix: [] for prefix in unique_prefixes}
 
-        for k, v in self.cnt.items():
+        for k, v in counter.items():
             if not '_' in k:
                 continue
             prefix = k.split('_')[0]
             tables[prefix].append(
                 f'{"":{pad_width}s}' +
-                f'{k:.<{key_width}s}' + 
+                f'{k:.<{key_width}s}' +
                 (
                     f'{v:.>{num_width},d}'
                     if prefix != 'perf'
-                    else f'{v:.>{num_width}.2f}'
+                    else f'{v:.>{num_width}.3f}'
                 ) +
                 f'{"":{pad_width}s}',
             )
@@ -1249,14 +1415,11 @@ cdef class DHTScraper:
             FILE *f
 
         f = fopen(RT_FN, 'wb')
-        fwrite(
-            self.rt, sizeof(u8),
-            256 * 256 * RT_CONTACTS_PER_BIN * NODEINFO_LEN, f,
-        )
+        fwrite(self.rt, sizeof(u8), RT_TOTAL_CONTACTS * NODEINFO_LEN, f)
         fclose(f)
 
         f = fopen(RT_QUAL_FN, 'wb')
-        fwrite(self.rt_qual, sizeof(u8), 256 * 256 * RT_CONTACTS_PER_BIN, f)
+        fwrite(self.rt_qual, sizeof(u8), RT_TOTAL_CONTACTS, f)
         fclose(f)
 
     cdef void load_data(self):
@@ -1265,16 +1428,12 @@ cdef class DHTScraper:
 
         f = fopen(RT_FN, 'rb')
         if f:
-            fread(
-                self.rt, sizeof(u8),
-                256 * 256 * RT_CONTACTS_PER_BIN * NODEINFO_LEN,
-                f,
-            )
+            fread(self.rt, sizeof(u8), RT_TOTAL_CONTACTS * NODEINFO_LEN, f)
             fclose(f)
 
         f = fopen(RT_QUAL_FN, 'rb')
         if f:
-            fread(self.rt_qual, sizeof(u8), 256 * 256 * RT_CONTACTS_PER_BIN, f)
+            fread(self.rt_qual, sizeof(u8), RT_TOTAL_CONTACTS, f)
             fclose(f)
 
     cdef double metric_rt_fullness(self):
@@ -1283,10 +1442,10 @@ cdef class DHTScraper:
 
         for ix in range(256):
             for jx in range(256):
-                for kx in range(RT_CONTACTS_PER_BIN):
-                    acc += self.rt[ix][jx][kx][0] / 128.
+                for kx in range(256):
+                    acc += self.rt[ix][jx][kx][0]
 
-        return acc / (256 * 256 * RT_CONTACTS_PER_BIN)
+        return acc / (RT_TOTAL_CONTACTS * 127.5)
 
     cdef double metric_av_quality(self):
         cdef:
@@ -1295,10 +1454,10 @@ cdef class DHTScraper:
 
         for ix in range(256):
             for jx in range(256):
-                for kx in range(RT_CONTACTS_PER_BIN):
+                for kx in range(256):
                     acc += self.rt_qual[ix][jx][kx]
 
-        return acc / (256 * 256 * RT_CONTACTS_PER_BIN)
+        return acc / (RT_TOTAL_CONTACTS)
 
     cdef mstd metric_gp_rtt(self):
         cdef u64 ix
@@ -1322,26 +1481,15 @@ cdef class DHTScraper:
 
         return result
 
-cdef inline void mk_sid_raw(u8 *sid_buf, u8 *nid):
-    '''MEM-UNSAFE'''
-    cdef u64 ix
-    for ix in range(0, IH_LEN):
-        sid_buf[ix] = nid[ix] ^ SID_XOR[ix]
+    cdef double metric_av_dkad(self):
+        cdef int ix
+        cdef double out = 0.
 
-# FIXME should need this since we have tok length in krpc_replies
-cdef bytes mk_sid(u8 *nid):
-    '''
-    MEM-UNSAFE
-    '''
-    cdef int ix
-    cdef unsigned char buf[IH_LEN]
-    cdef u8 *nsuf =\
-        b'\x00\x00X\xf3Q\xca\xf1=\xd42\xae\x86j\xa9\xd6\x0c=\xe8D\x99'
+        for ix in range(DKAD_BUF_LEN):
+            out += self._dkad_buf[ix]
 
-    for ix in range(0, IH_LEN):
-        buf[ix] = nid[ix] ^ nsuf[ix]
-
-    return bytes(buf[0:IH_LEN])
+        out /= DKAD_BUF_LEN
+        return out
 
 cdef bytes compact_peerinfo_bytes(bytes ip_addr, u16 port):
     '''
@@ -1396,6 +1544,7 @@ cdef inline bint compact_peerinfo(u8 *dest_buf, u8 *ip_addr, u16 port):
 
     return 1
 
+@cython.profile(False)
 cdef bytes compact_ip(bytes ip_addr):
     '''
     A reduced for if inet_aton that accepts bytes instead of str.
@@ -1422,9 +1571,11 @@ cdef bytes compact_ip(bytes ip_addr):
 
     return bytes(buf[0:4])
 
-# FIXME don't really need this, can use raw nodeinfo buffers
-# would get rid of a lot of cruft as well
-cdef void uncompact_nodeinfo(dht_node *target, u8 *pnode):
+@cython.profile(False)
+cdef inline tuple mk_addr_from_dht_node(dht_node_t *dhtn):
+    return (inet_ntoa(dhtn.pip[:IP_LEN]).encode('ascii'), dhtn.port)
+
+cdef bint uncompact_nodeinfo(dht_node_t *target, u8 *pnode):
     '''
     Uncompacts a packed node info string into a dht_contact structure.
 
@@ -1432,51 +1583,23 @@ cdef void uncompact_nodeinfo(dht_node *target, u8 *pnode):
     sid is precomputed.
     '''
 
-    target.valid = 0
+    if validate_nodeinfo(pnode):
+        memcpy(target.nid, pnode,           NIH_LEN)
+        memcpy(target.pip, pnode + NIH_LEN, IP_LEN)
+        target.port = unpack_port(pnode + NIH_LEN + IP_LEN)
+        return 1
+    return 0
 
-    if validate_peerinfo(pnode + NID_LEN):
-        memcpy(target.nid, pnode, NID_LEN)
-        memcpy(target.ip, pnode + NID_LEN, IP_LEN)
-        target.port = unpack_port(pnode + NID_LEN + IP_LEN)
-        target.valid = 1
-
-cdef tuple node_to_addr_tup(dht_node *node):
-    return (inet_ntoa(node.ip[:IP_LEN]).encode('ascii'), node.port)
+@cython.profile(False)
+cdef inline bint validate_nodeinfo(u8 *pnode):
+    return validate_peerinfo(pnode + NIH_LEN)
 
 @cython.profile(False)
 cdef inline u16 unpack_port(u8 *packed_port):
-    '''MEM-UNSAFE'''
+    '''
+    MEM-UNSAFE packed_port[0:1]
+    '''
     return packed_port[0] * 256 + packed_port[1]
-
-@cython.profile(False)
-cdef inline bint is_row_empty(u8 *row):
-    '''
-    MEM-UNSAFE
-    '''
-    return 0 == memcmp(row, ZERO_ROW, NODEINFO_LEN)
-
-@cython.profile(False)
-cdef inline bint is_row_equal(u8 *row, u8 *target, u64 up_to):
-    '''
-    MEM-UNSAFE [row[0:up_to], target[0:up_to]]
-    '''
-    return 0 == memcmp(row, target, up_to)
-
-# FIXME prio 7 randint is slow, use rand
-@cython.profile(False)
-cdef bint check_evict(u64 cur_qual, u64 cand_qual):
-    '''
-    Checks if a node with quality `cur_qual` should be replaced with
-    one of quality `cand_qual`.
-
-    If `cand_qual` > `cur_qual`, evicts certainly. Else, evicts with
-    probability 1 / 2 ** (cur_qual - cand_qual)
-    '''
-
-    if cand_qual >= cur_qual:
-        return 1
-
-    return randint(1 << (cur_qual - cand_qual)) == 0
 
 # FIXME prio 4 should not need this, should extract raw token from request and
 # pass it down
@@ -1487,6 +1610,12 @@ cdef bytes bencode_tok(bytes tok):
 
     return slt + b':' + tok
 
+@cython.profile(False)
+cdef inline bint validate_peerinfo(u8 *peerinfo):
+    '''MEM-UNSAFE'''
+    return validate_ip_p(peerinfo) and validate_port_p(peerinfo + IP_LEN)
+
+@cython.profile(False)
 cdef bint validate_ip_p(u8 *ip):
     '''
     MEM-UNSAFE
@@ -1537,14 +1666,57 @@ cdef inline bint validate_port_p(u8 *port):
     return validate_port(unpack_port(port))
 
 @cython.profile(False)
-cdef inline bint validate_peerinfo(u8 *peerinfo):
-    '''MEM-UNSAFE'''
-    return validate_ip_p(peerinfo) and validate_port_p(peerinfo + IP_LEN)
-
-@cython.profile(False)
-cdef inline bint validate_nodeinfo(u8 *nodeinfo):
-    '''MEM-UNSAFE'''
-    return validate_peerinfo(nodeinfo + NID_LEN)
-
 cdef inline void memcpy_bytes(u8 *target, u8 *source, u64 up_to):
     memcpy(target, source, up_to)
+
+@cython.profile(False)
+cdef inline bint is_row_empty(u8 *row):
+    '''
+    MEM-UNSAFE
+    '''
+    return 0 == memcmp(row, ZERO_ROW, NODEINFO_LEN)
+
+@cython.profile(False)
+cdef inline bint is_row_equal(u8 *row, u8 *target, u64 up_to):
+    '''
+    MEM-UNSAFE [row[0:up_to], target[0:up_to]]
+    '''
+    return 0 == memcmp(row, target, up_to)
+
+# FIXME prio 7 randint is slow, use rand
+@cython.profile(False)
+cdef bint check_evict(u64 cur_qual, u64 cand_qual):
+    '''
+    Checks if a node with quality `cur_qual` should be replaced with
+    one of quality `cand_qual`.
+
+    If `cand_qual` > `cur_qual`, evicts certainly. Else, evicts with
+    probability 1 / 2 ** (cur_qual - cand_qual)
+    '''
+
+    if cand_qual >= cur_qual:
+        return 1
+
+    return randint(1 << (cur_qual - cand_qual)) == 0
+
+# FIXME should need this since we have tok length in krpc_replies
+cdef bytes mk_sid(u8 *nid):
+    '''
+    MEM-UNSAFE
+    '''
+    cdef int ix
+    cdef unsigned char buf[NIH_LEN]
+    cdef u8 *nsuf =\
+        b'\x00\x00X\xf3Q\xca\xf1=\xd42\xae\x86j\xa9\xd6\x0c=\xe8D\x99'
+
+    for ix in range(0, NIH_LEN):
+        buf[ix] = nid[ix] ^ nsuf[ix]
+
+    return bytes(buf[0:NIH_LEN])
+
+@cython.profile(False)
+cdef inline void mk_sid_raw(u8 *sid_buf, u8 *nid):
+    '''MEM-UNSAFE'''
+    cdef u64 ix
+    for ix in range(0, NIH_LEN):
+        sid_buf[ix] = nid[ix] ^ SID_XOR[ix]

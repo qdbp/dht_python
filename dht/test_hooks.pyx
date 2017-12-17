@@ -3,8 +3,11 @@ Hooks to bring in pxd-defined c-level functions and objects into pure
 python scope for testing.
 '''
 
+include "dht_h.pxi"
+
 from bdecode_st cimport parsed_msg, krpc_bdecode, print_parsed_msg, g_trace
-from bdecode_st cimport bd_status, bd_status_names
+from bdecode_st cimport bd_status_names
+from stat cimport ST
 
 from util cimport LRUCache
 from util cimport LRU_EMTPY
@@ -12,9 +15,9 @@ from util cimport LRU_EMTPY
 cpdef show_bdecode(bytes b):
 
     cdef parsed_msg output
-    cdef bd_status status = krpc_bdecode(b, &output)
+    cdef u64 status = krpc_bdecode(b, &output)
 
-    if status == bd_status.NO_ERROR:
+    if status == ST.bd_a_no_error:
         print_parsed_msg(&output)
 
     return bd_status_names[status]

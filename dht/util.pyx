@@ -1,15 +1,14 @@
 # cython: profile=True
-from libc.stdint cimport uint64_t as u64, uint8_t as u8
-cimport cython
-
 include "dht_h.pxi"
 
+from cpython.mem cimport PyMem_Malloc, PyMem_Free
 
 @cython.freelist(16)
 cdef class LRULink:
     pass
 
 cdef object LRU_EMTPY = object()
+cdef object LRU_NONE = object()
 
 cdef class LRUCache:
     '''
@@ -114,7 +113,22 @@ cdef class LRUCache:
             return val
         else:
             self.misses += 1
-            return None
+            return LRU_NONE
+
+    # cdef object pop(self, object key):
+
+    #     if self.len > 0:
+    #         if key not in self.d:
+    #             return LRU_NONE
+
+    #         if self.len == 1:
+    #             self.head = self.tail = None
+
+    #         if self.d[key] is self.head:
+    #             self.head.nx.pr = None
+
+    #     else:
+    #         return LRU_EMTPY
 
     cdef object pophead(self):
         '''
@@ -188,7 +202,6 @@ cdef class LRUCache:
     def __len__(self):
         return self.len
 
-
 cdef u64 tab_kad[256]
 
 tab_kad = [8] + [7] + [6] * 2 + [5] * 4 + [4] * 8 + [3] * 16 + [2] * 32 + [1] * 64 + [0] * 128
@@ -197,7 +210,7 @@ tab_kad = [8] + [7] + [6] * 2 + [5] * 4 + [4] * 8 + [3] * 16 + [2] * 32 + [1] * 
 @cython.wraparound(False)
 cdef u64 sim_kad_apx(u8 *x, u8 *y):
     '''
-    MEM-UNSAFE [x[0:IH_LEN], y[0:IH_LEN]]
+    MEM-UNSAFE [x[0:NIH_LEN], y[0:NIH_LEN]]
 
     Approximate kademlia similarity, given by index of first bit at which the
     inputs differ, or 160 if they do not differ.
@@ -209,7 +222,7 @@ cdef u64 sim_kad_apx(u8 *x, u8 *y):
     cdef u8 byte_sim = 0
     cdef u64 ix = 0
 
-    for ix in range(IH_LEN):
+    for ix in range(NIH_LEN):
         byte_sim = tab_kad[x[ix] ^ y[ix]]
         out += byte_sim
         if byte_sim < 8:
@@ -248,3 +261,6 @@ cdef str format_uptime(u64 s):
         d = (s // (3600 * 24)) % 365
         return '{:>2d} y {:>2d} d'.format(y, d)
 
+
+cdef u32 randint(u32 mn, u32 mx):
+    pass    

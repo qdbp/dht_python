@@ -1,8 +1,7 @@
-from libc.stdint cimport uint64_t as u64, uint8_t as u8
-
+include "dht_h.pxi"
 
 cdef:
-    object LRU_EMTPY
+    object LRU_EMTPY, LRU_NONE
 
 cdef class LRULink:
     cdef public:
@@ -32,6 +31,7 @@ cdef class LRUCache:
         void traverse(self)
         void insert(self, object, object)
         object get(self, object)
+        # object pop(self, object)
         object pophead(self)
         object poptail(self)
         tuple stats(self)

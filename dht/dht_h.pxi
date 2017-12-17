@@ -1,3 +1,11 @@
+cimport cython
+
+from libc.stdint cimport uint8_t as u8, uint16_t as u16, uint32_t as u32, uint64_t as u64
+from libc.stdint cimport int8_t as i8, int16_t as i16, int32_t as i32, int64_t as i64
+from libc.string cimport memcmp, memset, memcpy
+
+from dht.stat cimport ST, ST_names
+
 # frequently switched flags
 DEF BD_TRACE = 0
 
@@ -5,12 +13,16 @@ DEF BD_TRACE = 0
 DEF IP_MAX_LEN = 18  # null-terminated
 
 # == KPRC DEFINITIONS
-DEF IH_LEN = 20
-DEF NID_LEN = 20
+DEF NIH_LEN = 20
 DEF IP_LEN = 4
 DEF PORT_LEN = 2
 DEF PEERINFO_LEN = IP_LEN + PORT_LEN
-DEF NODEINFO_LEN = NID_LEN + PEERINFO_LEN
+DEF NODEINFO_LEN = NIH_LEN + PEERINFO_LEN
+
+# our key values
+DEF TOKEN = 0x88
+DEF TOK = 0x77
+DEF MSG_BUF_LEN = 512
 
 # BDECODE SIZES
 DEF BD_MAXLEN = 512
@@ -20,10 +32,16 @@ DEF BD_MAXLEN_TOKEN = 32
 DEF BD_MAX_PEERS = 36
 DEF BD_MAX_NODES = 8
 
-# our key values
-DEF TOKEN = 0x88
-DEF TOK = 0x77
-DEF MSG_BUF_LEN = 512
+# bdecode message types
+DEF MSG_Q_AP = 1
+DEF MSG_Q_FN = 1 << 1
+DEF MSG_Q_GP = 1 << 2
+DEF MSG_Q_PG = 1 << 3
+        # R_AP 
+DEF MSG_R_FN = 1 << 5
+DEF MSG_R_GP = 1 << 6
+DEF MSG_R_PG = 1 << 7
+
 
 # MESSAGE LENGTHS
 # for computing sids from nids
@@ -58,7 +76,8 @@ DEF TERMINAL_WIDTH = 190
 # loop granularities
 DEF FP_SLEEP = 0.05
 DEF GP_SLEEP = 0.01
-DEF PURGE_SLEEP = 0.05
+DEF PURGE_SLEEP = 0.1
+DEF HO_PURGE_SLEEP = 5.0
 DEF BOOTSTRAP_SLEEP = 1.0
 DEF CONTROL_SLEEP = 1.0
 DEF INFO_SLEEP = 5.0
@@ -69,18 +88,22 @@ DEF IH_DESC_SLEEP = 5.0
 # cache sizes and flush intervals
 DEF MAX_NODES = 25000
 DEF IH_POOL_LEN = 1 << 16
-DEF RTT_BUF_LEN = 1000
 DEF ROW_POOL_MAXLEN = 1000
+DEF RECENT_PEER_CACHESIZE = 1 << 20
 
-DEF GP_QS_PER_IH = 2
+DEF RTT_BUF_LEN = 1000
+DEF DKAD_BUF_LEN = 1000
+
 DEF FP_THRESH = MAX_NODES // 2
 DEF FP_NUMBER = 5
 
-DEF BASE_IFL_TARGET = 500
+DEF BASE_IFL_TARGET = 2500
 DEF GPPS_RX_TARGET = 10000
 DEF GPPS_RX_MAX = 15000
 DEF BASE_IHASH_DISCARD = 0.25
 DEF BASE_IHASH_REFRESH = 0.03
+DEF BASE_IH_GP_HOLDOFF = 60
+DEF BASE_IH_DB_HOLDOFF = 600
 DEF BASE_PING_RATE = 0.05
 DEF BASE_GP_TIMEOUT = 1.0
 
@@ -90,8 +113,8 @@ DEF RT_QUAL_FN = b'./data/rt_qual.dat'
 DEF INFO_FILE = b'./live_info.txt'
 
 # rt constants
-DEF RT_CONTACTS_PER_BIN = 8
-DEF RT_TOTAL_CONTACTS = 256 * 256 * RT_CONTACTS_PER_BIN
+# DEF RT_CONTACTS_PER_BIN = 256
+DEF RT_TOTAL_CONTACTS = 256 * 256 * 256
 # rt replace codes
 DEF RT_REP_SUCCESS = 1
 DEF RT_REP_NO_EVICT = 2
