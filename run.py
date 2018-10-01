@@ -1,5 +1,5 @@
-import sys
 import signal as sig
+import sys
 import threading as thr
 
 from dht.dht import LOG, DHTScraper

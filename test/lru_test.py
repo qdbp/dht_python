@@ -2,7 +2,7 @@ from time import time
 from numpy.random import randint, random
 import numpy as np
 
-from dht.test_hooks import LRUCacheDummy
+from dht.test_hooks import LRUCacheDummy, get_lru_none, get_lru_empty
 
 
 def test_lru_basic():
@@ -12,29 +12,36 @@ def test_lru_basic():
     assert len(lru) == 0
     lru.poptail()
     lru.pophead()
-    lru.poptail()
+    assert lru.poptail() is get_lru_empty()
     assert len(lru) == 0
 
     lru.insert(0, 10)
     lru.insert(1, 11)
     lru.insert(0, 100)
+    lru.traverse()
 
     assert lru.pophead() == (0, 100)
     assert len(lru) == 1
 
     for i in range(20):
         lru.insert(i, 10 * i)
+    lru.traverse()
+
+    assert lru.pop(15) == 150
+    assert lru.pop(17) == 170
+    assert lru.pop(5) is get_lru_none()
 
     assert lru.pophead() == (19, 190)
-    assert len(lru) == 9
+    assert len(lru) == 7
     assert lru.poptail() == (10, 100)
-    assert len(lru) == 8
+    assert len(lru) == 6
 
     for i in range(10):
         lru.insert(0, i)
+    lru.traverse()
 
     assert lru.pophead() == (0, 9)
-    assert len(lru) == 8
+    assert len(lru) == 6
 
 
 def test_lru_fuzz():

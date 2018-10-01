@@ -10,7 +10,13 @@ from bdecode_st cimport bd_status_names
 from stat cimport ST
 
 from util cimport LRUCache
-from util cimport LRU_EMTPY
+from util cimport LRU_EMTPY, LRU_NONE
+
+cpdef get_lru_none():
+    return LRU_NONE
+
+cpdef get_lru_empty():
+    return LRU_EMTPY
 
 cpdef show_bdecode(bytes b):
 
@@ -42,6 +48,9 @@ cdef class LRUCacheDummy:
 
     cpdef get(self, key):
         return self._lru.get(key)
+
+    cpdef pop(self, key):
+        return self._lru.pop(key)
 
     cpdef pophead(self):
         return self._lru.pophead()

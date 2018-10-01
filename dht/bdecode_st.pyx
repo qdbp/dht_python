@@ -15,7 +15,7 @@ DEF BD_IKEY_TOKEN = 1 << 2
 DEF BD_IKEY_IH = 1 << 3
 DEF BD_IKEY_NID = 1 << 4
 DEF BD_IKEY_TARGET = 1 << 5
-DEF BD_IKEY_IP = 1 << 6
+DEF BD_IKEY_IMPLPORT = 1 << 6
 DEF BD_IKEY_PORT = 1 << 7
 DEF BD_IKEY_AP_NAME = 1 << 8
 DEF BD_OKEY_A = 1 << 9
@@ -43,37 +43,6 @@ cdef:
         MSG_R_FN: 'MSG_R_FN',
         MSG_R_GP: 'MSG_R_GP',
         MSG_R_PG: 'MSG_R_PG',
-    }
-
-    dict bd_status_names = {
-        ST.bd_a_no_error: 'bd_A_NO_ERROR',
-        ST.bd_x_msg_too_long: 'bd_X_MSG_TOO_LONG',
-        ST.bd_x_bad_eom: 'bd_UNEXPECTED_END',
-        ST.bd_x_bad_char: 'bd_X_BAD_CHAR',
-        ST.bd_x_list_is_key: 'bd_X_LIST.is_key',
-        ST.bd_y_inconsistent_type: 'bd_Y_INCONSISTENT_TYPE',
-        ST.bd_z_dicts_too_deep: 'bd_Z_DICTS_TOO_DEEP',
-        ST.bd_y_bad_length_peer: 'bd_Y_BAD_LENGTH_PEER',
-        ST.bd_y_bad_length_nodes: 'bd_Y_BAD_LENGTH_NODES',
-        ST.bd_y_bad_length_ih: 'bd_Y_BAD_LENGTH_IH',
-        ST.bd_y_bad_length_nid: 'bd_Y_BAD_LENGTH_NID',
-        ST.bd_y_bad_length_target: 'bd_Y_BAD_LENGTH_TARGET',
-        ST.bd_z_tok_too_long: 'bd_Z_TOK_TOO_LONG',
-        ST.bd_z_token_too_long: 'bd_Z_TOKEN_TOO_LONG',
-        ST.bd_y_port_overflow: 'bd_Y_PORT_OVERFLOW',
-        ST.bd_z_unknown_response: 'bd_Z_UNKNOWN_RESPONSE',
-        ST.bd_y_no_nid: 'bd_Y_NO_NID',
-        ST.bd_y_ap_no_port: 'bd_Y_AP_NO_PORT',
-        ST.bd_y_apgp_no_ih: 'bd_Y_APGP_NO_IH',
-        ST.bd_y_empty_gp_response: 'bd_Y_EMPTY_GP_RESPONSE',
-        ST.bd_y_fn_no_target: 'bd_Y_FN_NO_TARGET',
-        ST.bd_z_ping_body: 'bd_Z_PING_BODY',
-        ST.bd_y_no_tok: 'bd_Y_NO_TOK',
-        ST.err_bd_fallthrough: 'bd_E_FALLTHROUGH',
-        ST.bd_y_naked_value: 'bd_Y_NAKED_VALUE',
-        ST.bd_z_error_type: 'bd_Z_ERROR_TYPE',
-        ST.bd_z_unknown_query: 'bd_Z_UNKNOWN_QUERY',
-        ST.bd_y_vals_wo_token: 'bd_Y_VALS_WO_TOKEN',
     }
 
 cdef:
@@ -326,8 +295,9 @@ cdef inline void krpc_bdecode_s(
                     0 == memcmp(data + start, bdk_TOKEN, slen):
 
                 IF BD_TRACE: g_trace.append(
-                    '>>> matched ikey TOKEN; * -> *'
+                    '>>> matched ikey TOKEN; X -> X & ~MSG_R_FN'
                 )
+                state.msg_kind &= (~MSG_Q_FN)
                 # NOTE many random queries include a token, we allow for it
                 # state.msg_kind &= (MSG_Q_AP | MSG_R_GP | MSG_Q_GP)
                 state.current_key = BD_IKEY_TOKEN
@@ -358,8 +328,8 @@ cdef inline void krpc_bdecode_s(
                     '>>> matched ikey IMPLIED_PORT; * -> MSG_Q_AP'
                 )
                 state.msg_kind &= MSG_Q_AP
-                state.current_key = BD_IKEY_IP
-                state.seen_keys |= BD_IKEY_IP
+                state.current_key = BD_IKEY_IMPLPORT
+                state.seen_keys |= BD_IKEY_IMPLPORT
 
             # ignore name field in non-announce peer messages
             elif slen == bdk_AP_NAME_slen and\
@@ -376,7 +346,7 @@ cdef inline void krpc_bdecode_s(
         # no KRPC dicts should have a depth more than 2:
         # fail instantly if we see this
         else:
-            # XXX :^) 
+            # XXX :^)
             state.fail = ST.bd_z_dicts_too_deep
             IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
             return
@@ -428,9 +398,20 @@ cdef inline void krpc_bdecode_s(
                     memcpy(out.tok, data + start, slen)
 
             elif state.current_key == BD_OKEY_Y:
-                if slen == 1 and data[start] == 101:  # ord('e')
-                    state.fail = ST.bd_z_error_type
-                    IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
+                if slen == 1:
+                    if data[start] == 101:  # ord('e')
+                        state.fail = ST.bd_z_error_type
+                        IF BD_TRACE: g_trace.append(f'FAIL {state.fail}')
+                    elif data[start] == 114:  # ord('r')
+                        state.msg_kind &= R_ANY
+                    elif data[start] == 113:  # ord('q')
+                        state.msg_kind &= Q_ANY
+                    else:
+                        state.fail = ST.bd_z_unknown_type
+                        return
+                else:
+                    state.fail = ST.bd_z_unknown_type
+                    return
             else:
                 pass
 
@@ -683,86 +664,71 @@ cdef u64 krpc_bdecode(bytes data, parsed_msg *out):
     if state.fail != ST.bd_a_no_error:
         return state.fail
 
+    # MESSAGE SANITY FILTERING
     # ALL messages need a NID
     if not state.seen_keys & BD_IKEY_NID:
         return ST.bd_y_no_nid
 
+    # ...and a TOK
     if not state.seen_keys & BD_OKEY_T:
         return ST.bd_y_no_tok
-
-    if not state.msg_kind:
-        return ST.bd_z_unknown_query
 
     IF BD_TRACE: g_trace.append(
         f'??? DECIDING keys {state.seen_keys:b} methods {state.msg_kind:b}',
     )
 
-    # do method elimination
-    if state.seen_keys & BD_IKEY_TOKEN:
-
-        if not state.seen_keys & (BD_IKEY_NODES | BD_IKEY_VALUES):
-            IF BD_TRACE: g_trace.append(
-                '??? k_token && ~(k_nodes | k_values) -> ~r_gp'
-            )
-            state.msg_kind &= ~(MSG_R_GP)
-
-        if not state.seen_keys & BD_IKEY_IH:
-            IF BD_TRACE: g_trace.append(
-                '??? ~k_ih && k_token -> ~q_gp'
-            )
-            state.msg_kind &= ~(MSG_Q_GP)
-
+    # METHOD RESOLUTION
     # exact APs and GPs need an info_hash only
-    if state.msg_kind == MSG_Q_AP or state.msg_kind == MSG_Q_GP:
-        if not state.seen_keys & BD_IKEY_IH:
-            IF BD_TRACE: g_trace.append(
-                '=== REJECT (q_gp | q_ap) && ~ih'
-            )
-            return ST.bd_y_apgp_no_ih
+    if state.msg_kind & Q_ANY:
+        IF BD_TRACE: g_trace.append('??? DECIDING as query')
+        if state.msg_kind == MSG_Q_AP or state.msg_kind == MSG_Q_GP:
+            if not state.seen_keys & BD_IKEY_IH:
+                IF BD_TRACE: g_trace.append(
+                    '=== REJECT (q_gp | q_ap) && ~ih'
+                )
+                return ST.bd_y_apgp_no_ih
 
-        elif state.msg_kind == MSG_Q_AP and not\
-                state.seen_keys & (BD_IKEY_PORT | BD_IKEY_IP):
-            IF BD_TRACE: g_trace.append(
-                '=== REJECT q_ap && ~(port | ip)'
-            )
-            return ST.bd_y_ap_no_port
+            elif state.msg_kind == MSG_Q_AP and not\
+                    state.seen_keys & (BD_IKEY_PORT | BD_IKEY_IMPLPORT):
+                IF BD_TRACE: g_trace.append(
+                    '=== REJECT q_ap && ~(port | impl_port)'
+                )
+                return ST.bd_y_ap_no_port
+            else:
+                out.method = state.msg_kind
+                IF BD_TRACE: g_trace.append(
+                    f'=== ACCEPT {krpc_method_names[state.msg_kind]}')
+
+        # fns need a target
+        elif state.msg_kind == MSG_Q_FN:
+            if not state.seen_keys & BD_IKEY_TARGET:
+                IF BD_TRACE: g_trace.append('=== REJECT q_fn && ~target')
+                return ST.bd_y_fn_no_target
+            else:
+                IF BD_TRACE: g_trace.append('=== ACCEPT MSG_Q_FN')
+                out.method = MSG_Q_FN
+
+        # accept only simple pings
+        elif state.msg_kind == MSG_Q_PG:
+            if state.seen_keys & BD_IKEY_ANY_BODY:
+                IF BD_TRACE: g_trace.append('=== REJECT q_pg && body')
+                return ST.bd_z_ping_body
+            else:
+                IF BD_TRACE: g_trace.append('=== ACCEPT MSG_Q_PG')
+                out.method = MSG_Q_PG
+
         else:
-            out.method = state.msg_kind
-            IF BD_TRACE: g_trace.append(
-                f'=== ACCEPT {krpc_method_names[state.msg_kind]}')
-            return ST.bd_a_no_error
-
-    # fns need a target
-    elif state.msg_kind == MSG_Q_FN:
-        if not state.seen_keys & BD_IKEY_TARGET:
-            IF BD_TRACE: g_trace.append('=== REJECT q_fn && ~target')
-            return ST.bd_y_fn_no_target
-        else:
-            IF BD_TRACE: g_trace.append('=== ACCEPT MSG_Q_FN')
-            out.method = MSG_Q_FN
-            return ST.bd_a_no_error
-
-    # accept only simple pings
-    elif state.msg_kind == MSG_Q_PG:
-        if state.seen_keys & BD_IKEY_ANY_BODY:
-            IF BD_TRACE: g_trace.append('=== REJECT q_pg && body')
-            return ST.bd_z_ping_body
-        else:
-            IF BD_TRACE: g_trace.append('=== ACCEPT MSG_Q_PG')
-            out.method = MSG_Q_PG
-            return ST.bd_a_no_error
-
-    elif state.msg_kind & Q_ANY:
-        IF BD_TRACE: g_trace.append('=== REJECT fallthrough q_any')
-        return ST.bd_z_unknown_query
+            IF BD_TRACE: g_trace.append('=== REJECT fallthrough q_any')
+            return ST.bd_z_unknown_query
 
     elif state.msg_kind & R_ANY:
         IF BD_TRACE: g_trace.append('??? DECIDING as reply')
-        # get_peers reply have a token...
+
+        # TOKEN and (VALUES or NODES) <-> R_GP
         if state.seen_keys & BD_IKEY_TOKEN and\
                 state.seen_keys & (BD_IKEY_VALUES | BD_IKEY_NODES):
             IF BD_TRACE: g_trace.append(
-                '??? token & (nodes | values) -> r_gp'
+                '??? '
             )
             out.method = MSG_R_GP
             if out.n_nodes + out.n_peers == 0:
@@ -770,9 +736,12 @@ cdef u64 krpc_bdecode(bytes data, parsed_msg *out):
                     '=== REJECT r_gp && (n + v) == 0'
                 )
                 return ST.bd_y_empty_gp_response
-            IF BD_TRACE: g_trace.append('ACCEPT MSG_R_GP')
-            return ST.bd_a_no_error
 
+            IF BD_TRACE: g_trace.append(
+                '=== ACCEPT token && (nodes | values) -> MSG_R_GP'
+            )
+
+        # VALUES and ~TOKEN <-> bad R_GP
         elif state.seen_keys & BD_IKEY_VALUES and\
                 not state.seen_keys & BD_IKEY_TOKEN:
             IF BD_TRACE: g_trace.append(
@@ -780,27 +749,31 @@ cdef u64 krpc_bdecode(bytes data, parsed_msg *out):
             )
             return ST.bd_y_vals_wo_token
 
+        # ~TOKEN and ~VALUES and NODES <-> R_FN
         elif state.seen_keys & BD_IKEY_NODES:
             IF BD_TRACE: g_trace.append(
-                '=== ACCEPT ~[token & (nodes | values)] && nodes -> MSG_R_FN'
+                '=== ACCEPT ~token && ~values && nodes -> MSG_R_FN'
             )
             out.method = MSG_R_FN
-            return ST.bd_a_no_error
 
-        elif not (state.seen_keys & BD_IKEY_ANY_NON_TOKEN_BODY):
-            IF BD_TRACE: g_trace.append(
-                '=== ACCEPT ~(values | nodes) -> MSG_R_PG')
-            out.method = MSG_R_PG
-            return ST.bd_a_no_error
-
+        # ~NODES and ~VALUES <-> R_PG
         else:
-            IF BD_TRACE: g_trace.append('=== REJECT UNKNOWN RESPONSE')
-            return ST.bd_z_unknown_response
-    
+            if state.seen_keys & BD_IKEY_ANY_NON_TOKEN_BODY:
+                IF BD_TRACE: g_trace.append(
+                    '=== REJECT (body - tok) && ~(nodes || values) -> bad r_pg'
+                )
+                return ST.bd_z_ping_body
+
+            IF BD_TRACE: g_trace.append(
+                    '=== ACCEPT ~(values | nodes) -> MSG_R_PG')
+            out.method = MSG_R_PG
+
     else:
         IF BD_TRACE:
-            g_trace.append('REJECT FALLTHROUGH')
-        return ST.err_bd_fallthrough
+            g_trace.append('=== REJECT ~[type & (q | r)] -> incongruous')
+        return ST.bd_z_incongruous_message
+    
+    return ST.bd_a_no_error
 
 cdef void print_parsed_msg(parsed_msg *out):
 

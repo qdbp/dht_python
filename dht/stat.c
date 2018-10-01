@@ -19,7 +19,6 @@
 /* transmitted message statistics */\
     X(tx_tot) \
     X(tx_exc) \
-    X(tx_msg_drop_throt) \
     X(tx_msg_drop_overflow) \
     X(tx_q_ap) \
     X(tx_q_fn) \
@@ -34,6 +33,8 @@
     X(bm_ap_bad_token) \
     X(bm_nodes_invalid) \
     X(bm_peers_bad) \
+    X(bm_bullshit_dkad) \
+    X(bm_evil_source) \
 /* routing table constant */\
     X(rt_replace_accept) \
     X(rt_replace_reject) \
@@ -46,15 +47,14 @@
 /* database interaction statistics */\
     X(db_update_peers) \
     X(db_rows_inserted) \
-    X(db_lookups) \
-    X(db_lookups_success) \
 /* infohash lookup cycle statistics... mind these well */\
     X(ih_nodes_unmatched) \
     X(ih_nodes_matched) \
     X(ih_peers_unmatched) \
     X(ih_peers_matched) \
     X(ih_naked_exhausted) \
-    X(ih_move_naked_duplicate) \
+    X(ih_move_naked_dup_nid) \
+    X(ih_move_naked_dup_ih) \
     X(ih_move_naked_to_hold) \
     X(ih_move_rx_to_staging) \
     X(ih_move_hold_to_staging) \
@@ -64,6 +64,7 @@
     X(ih_stage_n_prefiltered) \
     X(ih_stage_n_recycled) \
     X(ih_stage_n_lookup) \
+    X(ih_db_lookup_success) \
 /* A: the message is accepted */\
     X(bd_a_no_error) \
 /* X: the bdecoding is ill-formed or we can't handle the message at all */\
@@ -91,14 +92,14 @@
     X(bd_z_tok_too_long) \
     X(bd_z_token_too_long) \
     X(bd_z_unknown_query) \
-    X(bd_z_unknown_response) \
+    X(bd_z_unknown_type) \
+    X(bd_z_incongruous_message) \
     X(bd_z_dicts_too_deep) \
     X(bd_z_ping_body) \
     X(bd_z_error_type) \
 /* E: there is a programming error */\
     X(err_bd_handle_fallthrough) \
     X(err_bd_empty_r_gp) \
-    X(err_bd_fallthrough) \
     X(err_rt_no_contacts) \
     X(err_rt_pulled_bad_node) \
     X(err_rx_exc) \

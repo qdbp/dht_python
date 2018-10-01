@@ -17,7 +17,6 @@ cdef extern from "stat.c":
 
         tx_tot,
         tx_exc,
-        tx_msg_drop_throt,
         tx_msg_drop_overflow,
         tx_q_ap,
         tx_q_fn,
@@ -32,6 +31,8 @@ cdef extern from "stat.c":
         bm_ap_bad_token,
         bm_nodes_invalid,
         bm_peers_bad,
+        bm_bullshit_dkad,
+        bm_evil_source,
 
         rt_replace_accept,
         rt_replace_reject,
@@ -44,15 +45,14 @@ cdef extern from "stat.c":
 
         db_update_peers,
         db_rows_inserted,
-        db_lookups,
-        db_lookups_success,
 
         ih_nodes_unmatched,
         ih_nodes_matched,
         ih_peers_unmatched,
         ih_peers_matched,
         ih_naked_exhausted,
-        ih_move_naked_duplicate,
+        ih_move_naked_dup_nid,
+        ih_move_naked_dup_ih,
         ih_move_naked_to_hold,
         ih_move_rx_to_staging,
         ih_move_hold_to_staging,
@@ -62,6 +62,7 @@ cdef extern from "stat.c":
         ih_stage_n_prefiltered,
         ih_stage_n_recycled,
         ih_stage_n_lookup,
+        ih_db_lookup_success,
 
         bd_a_no_error,
 
@@ -89,13 +90,13 @@ cdef extern from "stat.c":
         bd_z_tok_too_long,
         bd_z_token_too_long,
         bd_z_unknown_query,
-        bd_z_unknown_response,
+        bd_z_unknown_type,
+        bd_z_incongruous_message,
         bd_z_dicts_too_deep,
         bd_z_ping_body,
         bd_z_error_type,
 
         err_bd_handle_fallthrough,
-        err_bd_fallthrough,
         err_bd_empty_r_gp,
         err_rt_no_contacts,
         err_rt_pulled_bad_node,

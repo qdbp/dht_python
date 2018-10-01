@@ -34,6 +34,7 @@ cdef class LRUCache:
         # object pop(self, object)
         object pophead(self)
         object poptail(self)
+        object pop(self, object)
         tuple stats(self)
         void reset_stats(self)
 

@@ -115,20 +115,35 @@ cdef class LRUCache:
             self.misses += 1
             return LRU_NONE
 
-    # cdef object pop(self, object key):
+    cdef object pop(self, object key):
 
-    #     if self.len > 0:
-    #         if key not in self.d:
-    #             return LRU_NONE
+        if key not in self.d:
+            return LRU_NONE
 
-    #         if self.len == 1:
-    #             self.head = self.tail = None
+        if self.len == 0:
+            return LRU_EMTPY
 
-    #         if self.d[key] is self.head:
-    #             self.head.nx.pr = None
+        poplink = self.d.pop(key)
+        self.len -= 1
 
-    #     else:
-    #         return LRU_EMTPY
+        if self.len == 0:
+            self.head = self.tail = None
+
+        elif poplink is self.head:
+            self.head.nx.pr = None
+            self.head = self.head.nx
+
+        elif poplink is self.tail:
+            self.tail.pr.nx = None
+            self.tail = self.tail.pr
+
+        # the preceding cases exhaust len == 2, so we have that
+        # d[key] != self.tail && d[key] != self.head
+        else:
+            poplink.nx.pr = poplink.pr
+            poplink.pr.nx = poplink.nx
+
+        return poplink.val
 
     cdef object pophead(self):
         '''
@@ -138,24 +153,14 @@ cdef class LRUCache:
         If the LRU is empty, returns the special sentinel value LRU_EMTPY
         '''
 
-        cdef object key, val
+        cdef object key
 
         if self.len > 0:
+            # NOTE need separate reference, since 'self.head.key' as first
+            # elem of return tuple produces a pointer to the key of the NEXT
+            # head
             key = self.head.key
-            val = self.head.val
-
-            # we have a proper head
-            if self.head.nx is not None:
-                self.head.nx.pr = None
-                self.head = self.head.nx
-            # we popped the last object
-            else:
-                self.head = self.tail = None
-
-            del self.d[key]
-            self.len -= 1
-
-            return (key, val)
+            return (key, self.pop(self.head.key))
         else:
             return LRU_EMTPY
 
@@ -167,24 +172,11 @@ cdef class LRUCache:
         If the LRU is empty, returns the special sentinel value LRU_EMTPY
         '''
 
-        cdef object key, val
+        cdef object key
 
         if self.len > 0:
             key = self.tail.key
-            val = self.tail.val
-
-            # we have a proper tail
-            if self.tail.pr is not None:
-                self.tail.pr.nx = None
-                self.tail = self.tail.pr
-            # else we popped the last object
-            else:
-                self.head = self.tail = None
-
-            del self.d[key]
-            self.len -= 1
-
-            return (key, val)
+            return (key, self.pop(self.tail.key))
         else:
             return LRU_EMTPY
 
@@ -217,7 +209,7 @@ cdef u64 sim_kad_apx(u8 *x, u8 *y):
 
     Range [0, 160]
     '''
-    
+
     cdef u64 out = 0
     cdef u8 byte_sim = 0
     cdef u64 ix = 0
@@ -261,6 +253,6 @@ cdef str format_uptime(u64 s):
         d = (s // (3600 * 24)) % 365
         return '{:>2d} y {:>2d} d'.format(y, d)
 
-
 cdef u32 randint(u32 mn, u32 mx):
-    pass    
+    pass
+
